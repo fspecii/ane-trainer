@@ -92,7 +92,15 @@ write_layer_weights accounts for ~12ms of the 37ms layer Adam (12 layers × ~1MB
 - Cache weights in fp16 on CPU; Adam updates fp32 copy then converts
 - Already doing this. No further optimization without fp16 Adam precision issues.
 
-## Option G: ANE Forward Kernel Fusion (High Impact)
-108 ANE evals × ~420µs XPC overhead = ~45ms/step of pure scheduling
-If fwdAttn+fwdFFN fused: 108 → 84 evals → save ~10ms/step
-Most impactful remaining optimization.
+## Plan G: Fused fwdFwd Kernel (COMPLETE)
+Fused gen_sdpa_fwd_taps + gen_ffn_fwd_taps into single gen_fwd_fused kernel.
+- 9 weights: rms1, Wq, Wk, Wv, Wo, rms2, W1, W3, W2
+- 13-value concat output: x_out|oo|qf|kf|vf|af|xn|aw_flat|x2|h1|h3|gate|x2n
+- Output size: (9*DIM+SCORE_CH+3*HIDDEN)*SEQ = 16128*256 channels
+- Eliminates 12 fwdFFN ane_eval + 12 fwdFFN io_write per step
+- Also moves 2 residual vDSP_vadd per layer into kernel (24 fewer CPU ops)
+- Evals/step: 96 → 84 (7 kernels × 12 layers)
+- Measured improvement: ~2-4ms/step (~61ms vs ~63-65ms Plan D)
+  - Theoretical savings: 12 × 420µs = ~5ms
+  - Partial offset: larger fwdFwd ioOut (8MB vs 4MB) flush + x2 io_read back
+- 86 kernels compiled at startup (vs 74 old count, now correctly printed)

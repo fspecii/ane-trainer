@@ -25,10 +25,10 @@
 #define ACCUM_STEPS 10
 #define MAX_COMPILES 100
 
-// Weight-bearing kernels per layer: fwdAttn(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd12(1) + qkvBwd(1) = 5
-// Plus 3 weight-free kernels (dwW2, dwW13, dwWoQKV) = 8 total per layer (sdpaBwd2 fused into sdpaBwd12)
-// 5 * 12 = 60 weight-bearing kernels, 3 * 12 = 36 dW kernels = 96 total
-#define KERNELS_PER_LAYER 5
+// Weight-bearing kernels per layer: fwdFwd(1) + ffnBwd(1) + sdpaBwd12(1) + qkvBwd(1) = 4
+// Plus 3 weight-free kernels (dwW2, dwW13, dwWoQKV) = 7 total per layer
+// 4 * 12 = 48 weight-bearing kernels, 3 * 12 = 36 dW kernels = 84 total
+#define KERNELS_PER_LAYER 4
 #define TOTAL_WEIGHT_KERNELS (KERNELS_PER_LAYER * NLAYERS)
 
 // Attention score channels for SDPA backward
@@ -62,12 +62,10 @@ typedef struct {
 } LayerAdam;
 
 // Per-layer activation buffers (saved for backward)
-// Only fields needed for backward pass; taps stored in ANE IOSurfaces.
+// Residuals computed inside fwdFwd kernel; only layer_in and x2 need CPU copies.
 typedef struct {
     float *layer_in;    // [DIM, SEQ] input to this layer (rmsnorm1 bwd)
-    float *o_out;       // [DIM, SEQ] Wo output (attn residual add)
     float *x2;          // [DIM, SEQ] residual after attn (rmsnorm2 bwd input)
-    float *ffn_out;     // [DIM, SEQ] FFN output (ffn residual add)
 } LayerActs;
 
 // Per-layer gradient accumulators
@@ -87,7 +85,7 @@ typedef struct {
     void *tmpDir;
 } Kern;
 typedef struct {
-    Kern *fwdAttn, *fwdFFN, *ffnBwd, *sdpaBwd12, *qkvBwd;
+    Kern *fwdFwd, *ffnBwd, *sdpaBwd12, *qkvBwd;
     Kern *dwW2, *dwW13, *dwWoQKV;
 } LayerKernels;
 
@@ -155,13 +153,11 @@ static void layer_adam_free(LayerAdam *a) {
 static LayerActs layer_acts_alloc(void) {
     LayerActs a;
     a.layer_in=(float*)malloc(SEQ*DIM*4);
-    a.o_out=(float*)malloc(SEQ*DIM*4);
     a.x2=(float*)malloc(SEQ*DIM*4);
-    a.ffn_out=(float*)malloc(SEQ*DIM*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
-    free(a->layer_in); free(a->o_out); free(a->x2); free(a->ffn_out);
+    free(a->layer_in); free(a->x2);
 }
 static LayerGrads layer_grads_alloc(void) {
     LayerGrads g;

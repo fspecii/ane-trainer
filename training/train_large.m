@@ -1,7 +1,7 @@
 // train_large.m — Train stories110M (12 layers, 768dim, 3072hidden) on ANE
 // Uses pretokenized TinyStories data with cross-entropy loss
-// 72 kernels compiled once at startup (dynamic weights — no per-batch recompile)
-// + 2 new: ANE classifier (32000-ch conv) + ANE softmax = 74 total
+// 84 kernels compiled once at startup (dynamic weights — no per-batch recompile)
+// + 2: ANE classifier (32000-ch conv) + ANE softmax = 86 total
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
@@ -64,15 +64,12 @@ static bool compile_layer_kernels(LayerKernels *lk) {
         @"@model_path/weights/mask.bin": @{@"offset":@0, @"data":get_mask_blob()}
     };
 
-    // fwdAttn: wIns[0]=rms1[DIM], [1]=Wq[DIM²], [2]=Wk[DIM²], [3]=Wv[DIM²], [4]=Wo[DIM²]
-    int fwd_attn_w[] = {DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2};
-    lk->fwdAttn = compile_kern_dyn(gen_sdpa_fwd_taps(), mask_dict,
-        DIM*SEQ*2, fwd_attn_w, 5, (6*DIM+SCORE_CH)*SEQ*2);
-
-    // fwdFFN: wIns[0]=rms2[DIM], [1]=W1[HIDDEN×DIM], [2]=W3[HIDDEN×DIM], [3]=W2[DIM×HIDDEN]
-    int fwd_ffn_w[] = {DIM*2, HIDDEN*DIM*2, HIDDEN*DIM*2, DIM*HIDDEN*2};
-    lk->fwdFFN = compile_kern_dyn(gen_ffn_fwd_taps(), @{},
-        DIM*SEQ*2, fwd_ffn_w, 4, (2*DIM+3*HIDDEN)*SEQ*2);
+    // fwdFwd: fused attn+FFN; wIns[0]=rms1, [1]=Wq, [2]=Wk, [3]=Wv, [4]=Wo,
+    //         [5]=rms2, [6]=W1, [7]=W3, [8]=W2
+    int fwd_w[] = {DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2,
+                   DIM*2, HIDDEN*DIM*2, HIDDEN*DIM*2, DIM*HIDDEN*2};
+    lk->fwdFwd = compile_kern_dyn(gen_fwd_fused(), mask_dict,
+        DIM*SEQ*2, fwd_w, 9, (9*DIM+SCORE_CH+3*HIDDEN)*SEQ*2);
 
     // ffnBwd: wIns[0]=W2[DIM×HIDDEN], [1]=W1[HIDDEN×DIM], [2]=W3[HIDDEN×DIM]
     // transpose_x=true used in MIL — same weight shape, no separate transposed copy
@@ -102,24 +99,23 @@ static bool compile_layer_kernels(LayerKernels *lk) {
     lk->dwWoQKV = compile_kern_dyn(gen_dw_woqkv(), @{},
         6*DIM*SEQ*2, NULL, 0, 4*DIM*DIM*2);
 
-    return lk->fwdAttn && lk->fwdFFN && lk->ffnBwd && lk->sdpaBwd12 && lk->qkvBwd
+    return lk->fwdFwd && lk->ffnBwd && lk->sdpaBwd12 && lk->qkvBwd
         && lk->dwW2 && lk->dwW13 && lk->dwWoQKV;
 }
 
 // Write current layer weights to all weight IOSurfaces.
 // Call once after Adam update (or at startup) to sync weights with ANE kernels.
 static void write_layer_weights(LayerKernels *lk, LayerWeights *w) {
-    // fwdAttn: [0]=rms_att, [1]=Wq, [2]=Wk, [3]=Wv, [4]=Wo
-    io_write_wf16(lk->fwdAttn->wIns[0], w->rms_att, DIM);
-    io_write_wf16(lk->fwdAttn->wIns[1], w->Wq, DIM*DIM);
-    io_write_wf16(lk->fwdAttn->wIns[2], w->Wk, DIM*DIM);
-    io_write_wf16(lk->fwdAttn->wIns[3], w->Wv, DIM*DIM);
-    io_write_wf16(lk->fwdAttn->wIns[4], w->Wo, DIM*DIM);
-    // fwdFFN: [0]=rms_ffn, [1]=W1, [2]=W3, [3]=W2
-    io_write_wf16(lk->fwdFFN->wIns[0], w->rms_ffn, DIM);
-    io_write_wf16(lk->fwdFFN->wIns[1], w->W1, HIDDEN*DIM);
-    io_write_wf16(lk->fwdFFN->wIns[2], w->W3, HIDDEN*DIM);
-    io_write_wf16(lk->fwdFFN->wIns[3], w->W2, DIM*HIDDEN);
+    // fwdFwd: [0]=rms1, [1]=Wq, [2]=Wk, [3]=Wv, [4]=Wo, [5]=rms2, [6]=W1, [7]=W3, [8]=W2
+    io_write_wf16(lk->fwdFwd->wIns[0], w->rms_att, DIM);
+    io_write_wf16(lk->fwdFwd->wIns[1], w->Wq, DIM*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[2], w->Wk, DIM*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[3], w->Wv, DIM*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[4], w->Wo, DIM*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[5], w->rms_ffn, DIM);
+    io_write_wf16(lk->fwdFwd->wIns[6], w->W1, HIDDEN*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[7], w->W3, HIDDEN*DIM);
+    io_write_wf16(lk->fwdFwd->wIns[8], w->W2, DIM*HIDDEN);
     // ffnBwd: [0]=W2, [1]=W1, [2]=W3
     io_write_wf16(lk->ffnBwd->wIns[0], w->W2, DIM*HIDDEN);
     io_write_wf16(lk->ffnBwd->wIns[1], w->W1, HIDDEN*DIM);
@@ -133,10 +129,10 @@ static void write_layer_weights(LayerKernels *lk, LayerWeights *w) {
 }
 
 static void free_layer_kernels(LayerKernels *lk) {
-    free_kern(lk->fwdAttn); free_kern(lk->fwdFFN); free_kern(lk->ffnBwd);
+    free_kern(lk->fwdFwd); free_kern(lk->ffnBwd);
     free_kern(lk->sdpaBwd12); free_kern(lk->qkvBwd);
     free_kern(lk->dwW2); free_kern(lk->dwW13); free_kern(lk->dwWoQKV);
-    lk->fwdAttn = lk->fwdFFN = lk->ffnBwd = lk->sdpaBwd12 = lk->qkvBwd = NULL;
+    lk->fwdFwd = lk->ffnBwd = lk->sdpaBwd12 = lk->qkvBwd = NULL;
     lk->dwW2 = lk->dwW13 = lk->dwWoQKV = NULL;
 }
 
@@ -352,14 +348,14 @@ int main(int argc, char *argv[]) {
 
         double startup_compile_ms = tb_ms(mach_absolute_time() - tc0);
         printf("  Compiled %d kernels in %.0fms (one-time cost)\n",
-               TOTAL_WEIGHT_KERNELS + NLAYERS + 2, startup_compile_ms);
+               TOTAL_WEIGHT_KERNELS + 3*NLAYERS + 2, startup_compile_ms);
 
         // Write initial weights to IOSurfaces
         for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
         io_write_fp16(classifierKern->wIns[0], embed, VOCAB, DIM);
 
         // Cache _ANEClient for beginRealTimeTask/endRealTimeTask (90%+ jitter reduction)
-        ane_step_client_init(kern[0].fwdAttn);
+        ane_step_client_init(kern[0].fwdFwd);
 
         // Per-layer serial queues: layer L's dW runs concurrently with all other layers.
         // Single dispatch_group tracks all pending work for the global Adam-update barrier.
@@ -408,30 +404,17 @@ int main(int argc, char *argv[]) {
 
                     // Save layer input for rmsnorm1 backward
                     memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
-                    // Attention forward: x_cur → o_out,Q,K,V,attn_out,xnorm
+                    // Fused attn+FFN forward: x_cur → x_out (ch 0) + x2 (ch 7*DIM+SCORE_CH)
                     t0=mach_absolute_time();
                     dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
                     t1=mach_absolute_time(); t_cblas_wait+=tb_ms(t1-t0); t0=t1;
-                    io_write_fp16(kern[L].fwdAttn->ioIn, x_cur, DIM, SEQ);
+                    io_write_fp16(kern[L].fwdFwd->ioIn, x_cur, DIM, SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-                    ane_eval(kern[L].fwdAttn);
+                    ane_eval(kern[L].fwdFwd);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->o_out, 0, DIM, SEQ);
-                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-
-                    vDSP_vadd(x_cur, 1, ac->o_out, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
-
-                    // FFN forward
-                    io_write_fp16(kern[L].fwdFFN->ioIn, ac->x2, DIM, SEQ);
-                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-                    ane_eval(kern[L].fwdFFN);
-                    t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->ffn_out, 0, DIM, SEQ);
-                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-
-                    vDSP_vadd(ac->x2, 1, ac->ffn_out, 1, x_cur, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0);
+                    io_read_fp16(kern[L].fwdFwd->ioOut, x_cur, 0, DIM, SEQ);
+                    io_read_fp16(kern[L].fwdFwd->ioOut, ac->x2, 7*DIM+SCORE_CH, DIM, SEQ);
+                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0);
                 }
 
                 // Final RMSNorm (CPU — single call, cost ~0.1ms)
@@ -494,13 +477,13 @@ int main(int argc, char *argv[]) {
 
                     // FFN backward (ANE)
                     io_write_fp16_at(kern[L].ffnBwd->ioIn, 0, dffn, DIM, SEQ);
-                    io_copy(kern[L].ffnBwd->ioIn, DIM, kern[L].fwdFFN->ioOut, DIM, 2*HIDDEN, SEQ);
+                    io_copy(kern[L].ffnBwd->ioIn, DIM, kern[L].fwdFwd->ioOut, 8*DIM+SCORE_CH, 2*HIDDEN, SEQ);
                     ane_eval(kern[L].ffnBwd);
                     io_read_fp16(kern[L].ffnBwd->ioOut, dx_ffn, 0, DIM, SEQ);
 
                     // dW2 = dffn[DIM,SEQ] @ silu[HIDDEN,SEQ]^T
-                    io_copy(kern[L].dwW2->ioIn, 0,   kern[L].ffnBwd->ioIn,  0,           DIM,    SEQ);
-                    io_copy(kern[L].dwW2->ioIn, DIM,  kern[L].fwdFFN->ioOut, DIM+2*HIDDEN, HIDDEN, SEQ);
+                    io_copy(kern[L].dwW2->ioIn, 0,   kern[L].ffnBwd->ioIn,  0,                         DIM,    SEQ);
+                    io_copy(kern[L].dwW2->ioIn, DIM,  kern[L].fwdFwd->ioOut, 8*DIM+SCORE_CH+2*HIDDEN,  HIDDEN, SEQ);
                     ane_eval(kern[L].dwW2);
                     {
                         Kern *dw2 = kern[L].dwW2;
@@ -513,8 +496,8 @@ int main(int argc, char *argv[]) {
                     }
 
                     // dW13 = concat(dh1,dh3)[2*HIDDEN,SEQ] @ x2n[DIM,SEQ]^T
-                    io_copy(kern[L].dwW13->ioIn, 0,       kern[L].ffnBwd->ioOut, DIM,          2*HIDDEN, SEQ);
-                    io_copy(kern[L].dwW13->ioIn, 2*HIDDEN, kern[L].fwdFFN->ioOut, DIM+3*HIDDEN, DIM,     SEQ);
+                    io_copy(kern[L].dwW13->ioIn, 0,       kern[L].ffnBwd->ioOut, DIM,                        2*HIDDEN, SEQ);
+                    io_copy(kern[L].dwW13->ioIn, 2*HIDDEN, kern[L].fwdFwd->ioOut, 8*DIM+SCORE_CH+3*HIDDEN,  DIM,      SEQ);
                     ane_eval(kern[L].dwW13);
                     {
                         Kern *dw13 = kern[L].dwW13;
@@ -535,18 +518,18 @@ int main(int argc, char *argv[]) {
                     vDSP_vadd(dx2, 1, dy, 1, dx2, 1, (vDSP_Length)(SEQ*DIM));
 
                     // Fused SDPA backward (ANE): [probs_flat|qf|kf|vf|dx2f] → [dqf|dkf|dvf]
-                    // probs_flat from fwdAttn ioOut ch 6*DIM (saved by gen_sdpa_fwd_taps)
-                    io_copy(kern[L].sdpaBwd12->ioIn, 0,          kern[L].fwdAttn->ioOut, 6*DIM, SCORE_CH, SEQ);
-                    io_copy(kern[L].sdpaBwd12->ioIn, SCORE_CH,   kern[L].fwdAttn->ioOut, DIM,   3*DIM,    SEQ);
+                    // probs_flat from fwdFwd ioOut ch 7*DIM, qf|kf|vf from ch 2*DIM
+                    io_copy(kern[L].sdpaBwd12->ioIn, 0,          kern[L].fwdFwd->ioOut, 7*DIM, SCORE_CH, SEQ);
+                    io_copy(kern[L].sdpaBwd12->ioIn, SCORE_CH,   kern[L].fwdFwd->ioOut, 2*DIM, 3*DIM,    SEQ);
                     io_write_fp16_at(kern[L].sdpaBwd12->ioIn, SCORE_CH+3*DIM, dx2, DIM, SEQ);
                     ane_eval(kern[L].sdpaBwd12);
 
                     // dWoQKV: outer products for Wo,Wq,Wk,Wv each [DIM,DIM]
                     // sdpaBwd12 output: [dqf|dkf|dvf] at [0|DIM|2*DIM]
-                    io_copy(kern[L].dwWoQKV->ioIn, 0,     kern[L].sdpaBwd12->ioIn, SCORE_CH+3*DIM, DIM, SEQ);  // dx2f
-                    io_copy(kern[L].dwWoQKV->ioIn, DIM,   kern[L].sdpaBwd12->ioOut, 0,     2*DIM, SEQ);  // dqf+dkf
-                    io_copy(kern[L].dwWoQKV->ioIn, 3*DIM, kern[L].sdpaBwd12->ioOut, 2*DIM, DIM,   SEQ);  // dvf
-                    io_copy(kern[L].dwWoQKV->ioIn, 4*DIM, kern[L].fwdAttn->ioOut,   4*DIM, 2*DIM, SEQ);  // attn+xnorm
+                    io_copy(kern[L].dwWoQKV->ioIn, 0,     kern[L].sdpaBwd12->ioIn,  SCORE_CH+3*DIM, DIM,   SEQ);  // dx2f
+                    io_copy(kern[L].dwWoQKV->ioIn, DIM,   kern[L].sdpaBwd12->ioOut, 0,              2*DIM, SEQ);  // dqf+dkf
+                    io_copy(kern[L].dwWoQKV->ioIn, 3*DIM, kern[L].sdpaBwd12->ioOut, 2*DIM,          DIM,   SEQ);  // dvf
+                    io_copy(kern[L].dwWoQKV->ioIn, 4*DIM, kern[L].fwdFwd->ioOut,    5*DIM,          2*DIM, SEQ);  // af+xn
                     ane_eval(kern[L].dwWoQKV);
                     {
                         Kern *dwaqkv = kern[L].dwWoQKV;

@@ -155,6 +155,132 @@ static NSString *gen_ffn_fwd_taps(void) {
     return m;
 }
 
+// Fused forward: attn + FFN for a single layer (eliminates 1 ane_eval + 1 io_write per layer)
+// Input: x [1,DIM,1,SEQ], 9 weight params
+// wIns[0]=rms1, [1]=Wq, [2]=Wk, [3]=Wv, [4]=Wo, [5]=rms2, [6]=W1, [7]=W3, [8]=W2
+// Output [1, (9*DIM+SCORE_CH+3*HIDDEN), 1, SEQ]:
+//   ch 0:                      x_out [DIM]        — x2 + y  (next layer input)
+//   ch DIM:                    oo [DIM]            — Wo projection output
+//   ch 2*DIM:                  qf [DIM]            — Q projection
+//   ch 3*DIM:                  kf [DIM]            — K projection
+//   ch 4*DIM:                  vf [DIM]            — V projection
+//   ch 5*DIM:                  af [DIM]            — attn before Wo
+//   ch 6*DIM:                  xn [DIM]            — rmsnorm1 output
+//   ch 7*DIM:                  aw_flat [SCORE_CH]  — softmax weights for sdpaBwd12
+//   ch 7*DIM+SCORE_CH:         x2 [DIM]            — residual after attn (for rmsnorm2_bwd)
+//   ch 8*DIM+SCORE_CH:         h1 [HIDDEN]         — FFN gate pre-act
+//   ch 8*DIM+SCORE_CH+HIDDEN:  h3 [HIDDEN]         — FFN gate
+//   ch 8*DIM+SCORE_CH+2*HIDDEN: gate [HIDDEN]      — silu(h1)*h3
+//   ch 8*DIM+SCORE_CH+3*HIDDEN: x2n [DIM]          — rmsnorm2 output
+static NSString *gen_fwd_fused(void) {
+    float sc = 1.0f/sqrtf((float)HD);
+    float invd = 1.0f/(float)DIM;
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>("
+                    @"tensor<fp16, [1, %d, 1, %d]> x, "
+                    @"tensor<fp16, [1, %d, 1, 1]> rms1, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> Wq, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> Wk, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> Wv, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> Wo, "
+                    @"tensor<fp16, [1, %d, 1, 1]> rms2, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> W1, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> W3, "
+                    @"tensor<fp16, [%d, %d, 1, 1]> W2) {\n",
+                    DIM, SEQ, DIM,
+                    DIM, DIM, DIM, DIM, DIM, DIM, DIM, DIM,
+                    DIM, HIDDEN, DIM, HIDDEN, DIM, DIM, HIDDEN];
+
+    // ===== RMSNorm1: x → xn =====
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x,y=x)[name=string(\"sq\")];\n", DIM, SEQ];
+    [m appendString:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendString:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", SEQ];
+    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", SEQ];
+    [m appendString:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", SEQ];
+    [m appendString:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xn = mul(x=xr,y=rms1)[name=string(\"xn\")];\n", DIM, SEQ];
+
+    // ===== Conv constants (shared by all 7 convolutions) =====
+    [m appendString:@CONV_CONST];
+
+    // ===== Q, K, V projections =====
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wq,x=xn)[name=string(\"cq\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wk,x=xn)[name=string(\"ck\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wv,x=xn)[name=string(\"cv\")];\n", DIM, SEQ];
+
+    // ===== Reshape Q, K, V to multi-head and transpose =====
+    [m appendFormat:@"        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n", HEADS, HD, SEQ];
+    [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> q4 = reshape(shape=qsh,x=qf)[name=string(\"rq\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> q = transpose(perm=pm,x=q4)[name=string(\"tq\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> k4 = reshape(shape=qsh,x=kf)[name=string(\"rk\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> k = transpose(perm=pm,x=k4)[name=string(\"tk\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> v4 = reshape(shape=qsh,x=vf)[name=string(\"rv\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> v = transpose(perm=pm,x=v4)[name=string(\"tv\")];\n", HEADS, SEQ, HD];
+
+    // ===== SDPA =====
+    [m appendString:@"        bool tx = const()[name=string(\"tx\"), val=bool(false)];\n"];
+    [m appendString:@"        bool ty = const()[name=string(\"ty\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> sc1 = matmul(transpose_x=tx,transpose_y=ty,x=q,y=k)[name=string(\"mm1\")];\n", HEADS, SEQ, SEQ];
+    [m appendFormat:@"        fp16 scv = const()[name=string(\"scv\"), val=fp16(%f)];\n", sc];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];\n", HEADS, SEQ, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,%d,%d]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];\n", SEQ, SEQ, SEQ, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];\n", HEADS, SEQ, SEQ];
+    [m appendString:@"        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];\n", HEADS, SEQ, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> a4 = matmul(transpose_x=tx,transpose_y=tx,x=aw,y=v)[name=string(\"mm2\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> af4s = const()[name=string(\"af4s\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> af = reshape(shape=af4s,x=at)[name=string(\"af\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> oo = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=af)[name=string(\"co\")];\n", DIM, SEQ];
+
+    // ===== Residual 1: x2 = x + oo =====
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2 = add(x=x,y=oo)[name=string(\"x2\")];\n", DIM, SEQ];
+
+    // ===== RMSNorm2: x2 → x2n (all names suffixed to avoid collisions with rmsnorm1) =====
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq2 = mul(x=x2,y=x2)[name=string(\"sq2\")];\n", DIM, SEQ];
+    [m appendString:@"        tensor<int32, [1]> rax2 = const()[name=string(\"rax2\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendString:@"        bool kd2 = const()[name=string(\"kd2\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ssf = reduce_sum(x=sq2,axes=rax2,keep_dims=kd2)[name=string(\"ssf\")];\n", SEQ];
+    [m appendFormat:@"        fp16 invd2 = const()[name=string(\"invd2\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2f = mul(x=ssf,y=invd2)[name=string(\"ss2f\")];\n", SEQ];
+    [m appendString:@"        fp16 eps2 = const()[name=string(\"eps2\"), val=fp16(0.00001)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3f = add(x=ss2f,y=eps2)[name=string(\"ss3f\")];\n", SEQ];
+    [m appendString:@"        fp16 nhalf2 = const()[name=string(\"nhalf2\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms2 = pow(x=ss3f,y=nhalf2)[name=string(\"rrms2\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr2 = mul(x=x2,y=rrms2)[name=string(\"xr2\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2n = mul(x=xr2,y=rms2)[name=string(\"x2n\")];\n", DIM, SEQ];
+
+    // ===== FFN: W1, W3 projections, SiLU gate, W2 projection =====
+    // pt/st/pd/dl/gr already defined above — reused here
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W1,x=x2n)[name=string(\"c1\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W3,x=x2n)[name=string(\"c3\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sig = sigmoid(x=h1)[name=string(\"sg\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", DIM, SEQ];
+
+    // ===== Residual 2: xout = x2 + y =====
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xout = add(x=x2,y=y)[name=string(\"xout\")];\n", DIM, SEQ];
+
+    // ===== Output concat =====
+    // Reshape aw [1,HEADS,SEQ,SEQ] → aw_flat [1,SCORE_CH,1,SEQ] for sdpaBwd12
+    [m appendFormat:@"        tensor<int32, [4]> awsh = const()[name=string(\"awsh\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", SCORE_CH, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> awfl = reshape(shape=awsh,x=aw)[name=string(\"awfl\")];\n", SCORE_CH, SEQ];
+    [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
+    [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(xout,oo,qf,kf,vf,af,xn,awfl,x2,h1,h3,gate,x2n))[name=string(\"cat\")];\n",
+                    9*DIM+SCORE_CH+3*HIDDEN, SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
 // FFN backward: concat(dffn,h1,h3) → concat(dx,dh1,dh3)
 // Params: x [1,DIM+2*HIDDEN,1,SEQ], W2 [1,DIM,HIDDEN], W1 [1,HIDDEN,DIM], W3 [1,HIDDEN,DIM]
 // Backward uses transpose_x=true to compute W^T @ d without storing transposed weights.
