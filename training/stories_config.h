@@ -86,7 +86,14 @@ typedef struct {
 } LayerGrads;
 
 // ANE kernels per layer
-typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
+typedef struct {
+    void *model;
+    IOSurfaceRef ioIn, ioOut;   // activation input, output
+    IOSurfaceRef *wIns;         // weight input surfaces (dynamic weights)
+    int nWIns;
+    void *request;
+    void *tmpDir;
+} Kern;
 typedef struct {
     Kern *fwdAttn, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd;
 } LayerKernels;

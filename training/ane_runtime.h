@@ -7,6 +7,12 @@
 #import <dlfcn.h>
 #import <IOSurface/IOSurface.h>
 
+// Persistent compile cache. Survives process restarts (exec() or cold start).
+// Keyed by hexStringIdentifier (SHA-256 of MIL + weights + options).
+#ifndef ANE_CACHE_DIR
+#define ANE_CACHE_DIR "~/.ane_cache"
+#endif
+
 typedef struct {
     id model;               // _ANEInMemoryModel
     IOSurfaceRef *ioInputs;
@@ -46,11 +52,13 @@ static IOSurfaceRef ane_create_surface(size_t bytes) {
 // milText: NSData of MIL text
 // weightData: NSData of raw weight blob (can be nil)
 // inputSizes/outputSizes: arrays of byte sizes for each I/O tensor
+// Returns NULL on failure. Logs "[cache hit]" or "[compiled]" to stdout.
 static ANEKernel *ane_compile(NSData *milText, NSData *weightData,
                                int nInputs, size_t *inputSizes,
                                int nOutputs, size_t *outputSizes) {
     ane_init();
     NSError *e = nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
 
     NSDictionary *wdict = nil;
     if (weightData) {
@@ -64,27 +72,55 @@ static ANEKernel *ane_compile(NSData *milText, NSData *weightData,
     id mdl = ((id(*)(Class,SEL,id))objc_msgSend)(
         g_ANEInMem, @selector(inMemoryModelWithDescriptor:), desc);
 
-    // Pre-populate temp dir with MIL + weights
-    id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
+    NSString *hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
     NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
-    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *cacheBase = [[@ANE_CACHE_DIR stringByExpandingTildeInPath]
+                            stringByAppendingPathComponent:hx];
+    NSString *cachedData    = [cacheBase stringByAppendingPathComponent:@"data"];
+    NSString *cachedPlist   = [cacheBase stringByAppendingPathComponent:@"net.plist"];
+
+    // Always write MIL + weights to tmpDir (needed by loadWithQoS: regardless of cache)
     [fm createDirectoryAtPath:[td stringByAppendingPathComponent:@"weights"]
         withIntermediateDirectories:YES attributes:nil error:nil];
     [milText writeToFile:[td stringByAppendingPathComponent:@"model.mil"] atomically:YES];
     if (weightData)
         [weightData writeToFile:[td stringByAppendingPathComponent:@"weights/weight.bin"] atomically:YES];
 
-    if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-            mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-        fprintf(stderr, "ANE compile failed: %s\n", [[e description] UTF8String]);
-        [fm removeItemAtPath:td error:nil];
-        return NULL;
+    BOOL loaded = NO;
+
+    // Cache hit: restore compiled artifacts and skip compileWithQoS:
+    if ([fm fileExistsAtPath:cachedData]) {
+        [fm copyItemAtPath:cachedData  toPath:[td stringByAppendingPathComponent:@"data"]    error:nil];
+        [fm copyItemAtPath:cachedPlist toPath:[td stringByAppendingPathComponent:@"net.plist"] error:nil];
+        if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
+            loaded = YES;
+        }
+        // If load from cache failed (stale/corrupt), fall through to recompile
     }
-    if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-            mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
-        fprintf(stderr, "ANE load failed: %s\n", [[e description] UTF8String]);
-        [fm removeItemAtPath:td error:nil];
-        return NULL;
+
+    if (!loaded) {
+        // Full compile path
+        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
+            fprintf(stderr, "ANE compile failed: %s\n", [[e description] UTF8String]);
+            [fm removeItemAtPath:td error:nil];
+            return NULL;
+        }
+
+        // Save compiled artifacts before load (load may move/delete them internally)
+        [fm createDirectoryAtPath:cacheBase withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm copyItemAtPath:[td stringByAppendingPathComponent:@"data"]
+                   toPath:cachedData error:nil];
+        [fm copyItemAtPath:[td stringByAppendingPathComponent:@"net.plist"]
+                   toPath:cachedPlist error:nil];
+
+        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
+            fprintf(stderr, "ANE load failed: %s\n", [[e description] UTF8String]);
+            [fm removeItemAtPath:td error:nil];
+            return NULL;
+        }
     }
 
     ANEKernel *k = calloc(1, sizeof(ANEKernel));

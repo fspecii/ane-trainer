@@ -55,45 +55,69 @@ static bool load_pretrained(LayerWeights *lw, float *rms_final, float *embed, co
     return true;
 }
 
-// ===== Compile one layer's kernels =====
-static bool compile_layer_kernels(LayerKernels *lk, LayerWeights *w) {
-    lk->fwdAttn = compile_kern_mil_w(gen_sdpa_fwd_taps(), (@{
-        @"@model_path/weights/rms1.bin": @{@"offset":@0, @"data":build_blob(w->rms_att,1,DIM)},
-        @"@model_path/weights/wq.bin": @{@"offset":@0, @"data":build_blob(w->Wq,DIM,DIM)},
-        @"@model_path/weights/wk.bin": @{@"offset":@0, @"data":build_blob(w->Wk,DIM,DIM)},
-        @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":build_blob(w->Wv,DIM,DIM)},
-        @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":build_blob(w->Wo,DIM,DIM)},
-        @"@model_path/weights/mask.bin": @{@"offset":@0, @"data":get_mask_blob()},
-    }), DIM*SEQ*2, 6*DIM*SEQ*2);
+// ===== Compile one layer's kernels (dynamic weights — compile once at startup) =====
+// Weights are NOT baked in; they're written to wIns IOSurfaces before each eval.
+static bool compile_layer_kernels(LayerKernels *lk) {
+    NSDictionary *mask_dict = @{
+        @"@model_path/weights/mask.bin": @{@"offset":@0, @"data":get_mask_blob()}
+    };
 
-    lk->fwdFFN = compile_kern_mil_w(gen_ffn_fwd_taps(), (@{
-        @"@model_path/weights/rms2.bin": @{@"offset":@0, @"data":build_blob(w->rms_ffn,1,DIM)},
-        @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":build_blob(w->W1,HIDDEN,DIM)},
-        @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":build_blob(w->W3,HIDDEN,DIM)},
-        @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":build_blob(w->W2,DIM,HIDDEN)},
-    }), DIM*SEQ*2, (2*DIM+3*HIDDEN)*SEQ*2);
+    // fwdAttn: wIns[0]=rms1[DIM], [1]=Wq[DIM²], [2]=Wk[DIM²], [3]=Wv[DIM²], [4]=Wo[DIM²]
+    int fwd_attn_w[] = {DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2, DIM*DIM*2};
+    lk->fwdAttn = compile_kern_dyn(gen_sdpa_fwd_taps(), mask_dict,
+        DIM*SEQ*2, fwd_attn_w, 5, 6*DIM*SEQ*2);
 
-    lk->ffnBwd = compile_kern_mil_w(gen_ffn_bwd(), (@{
-        @"@model_path/weights/w2t.bin": @{@"offset":@0, @"data":build_blob_t(w->W2,DIM,HIDDEN)},
-        @"@model_path/weights/w1t.bin": @{@"offset":@0, @"data":build_blob_t(w->W1,HIDDEN,DIM)},
-        @"@model_path/weights/w3t.bin": @{@"offset":@0, @"data":build_blob_t(w->W3,HIDDEN,DIM)},
-    }), (DIM+2*HIDDEN)*SEQ*2, (DIM+2*HIDDEN)*SEQ*2);
+    // fwdFFN: wIns[0]=rms2[DIM], [1]=W1[HIDDEN×DIM], [2]=W3[HIDDEN×DIM], [3]=W2[DIM×HIDDEN]
+    int fwd_ffn_w[] = {DIM*2, HIDDEN*DIM*2, HIDDEN*DIM*2, DIM*HIDDEN*2};
+    lk->fwdFFN = compile_kern_dyn(gen_ffn_fwd_taps(), @{},
+        DIM*SEQ*2, fwd_ffn_w, 4, (2*DIM+3*HIDDEN)*SEQ*2);
 
-    lk->sdpaBwd1 = compile_kern_mil_w(gen_sdpa_bwd1(), (@{
-        @"@model_path/weights/mask.bin": @{@"offset":@0, @"data":get_mask_blob()},
-        @"@model_path/weights/wot.bin": @{@"offset":@0, @"data":build_blob_t(w->Wo,DIM,DIM)},
-    }), 4*DIM*SEQ*2, (DIM+2*SCORE_CH)*SEQ*2);
+    // ffnBwd: wIns[0]=W2[DIM×HIDDEN], [1]=W1[HIDDEN×DIM], [2]=W3[HIDDEN×DIM]
+    // transpose_x=true used in MIL — same weight shape, no separate transposed copy
+    int ffn_bwd_w[] = {DIM*HIDDEN*2, HIDDEN*DIM*2, HIDDEN*DIM*2};
+    lk->ffnBwd = compile_kern_dyn(gen_ffn_bwd(), @{},
+        (DIM+2*HIDDEN)*SEQ*2, ffn_bwd_w, 3, (DIM+2*HIDDEN)*SEQ*2);
 
-    lk->qkvBwd = compile_kern_mil_w(gen_qkvb(), (@{
-        @"@model_path/weights/wqt.bin": @{@"offset":@0, @"data":build_blob_t(w->Wq,DIM,DIM)},
-        @"@model_path/weights/wkt.bin": @{@"offset":@0, @"data":build_blob_t(w->Wk,DIM,DIM)},
-        @"@model_path/weights/wvt.bin": @{@"offset":@0, @"data":build_blob_t(w->Wv,DIM,DIM)},
-    }), 3*DIM*SEQ*2, DIM*SEQ*2);
+    // sdpaBwd1: wIns[0]=Wo[DIM²] — Wo^T via transpose_x=true
+    int sdpa_bwd1_w[] = {DIM*DIM*2};
+    lk->sdpaBwd1 = compile_kern_dyn(gen_sdpa_bwd1(), mask_dict,
+        4*DIM*SEQ*2, sdpa_bwd1_w, 1, (DIM+2*SCORE_CH)*SEQ*2);
+
+    // qkvBwd: wIns[0]=Wq[DIM²], [1]=Wk[DIM²], [2]=Wv[DIM²] — W^T via transpose_x=true
+    int qkv_bwd_w[] = {DIM*DIM*2, DIM*DIM*2, DIM*DIM*2};
+    lk->qkvBwd = compile_kern_dyn(gen_qkvb(), @{},
+        3*DIM*SEQ*2, qkv_bwd_w, 3, DIM*SEQ*2);
 
     return lk->fwdAttn && lk->fwdFFN && lk->ffnBwd && lk->sdpaBwd1 && lk->qkvBwd;
 }
 
-// Compile weight-free sdpaBwd2 (only needs once, no weights)
+// Write current layer weights to all weight IOSurfaces.
+// Call once after Adam update (or at startup) to sync weights with ANE kernels.
+static void write_layer_weights(LayerKernels *lk, LayerWeights *w) {
+    // fwdAttn: [0]=rms_att, [1]=Wq, [2]=Wk, [3]=Wv, [4]=Wo
+    io_write_wf16(lk->fwdAttn->wIns[0], w->rms_att, DIM);
+    io_write_wf16(lk->fwdAttn->wIns[1], w->Wq, DIM*DIM);
+    io_write_wf16(lk->fwdAttn->wIns[2], w->Wk, DIM*DIM);
+    io_write_wf16(lk->fwdAttn->wIns[3], w->Wv, DIM*DIM);
+    io_write_wf16(lk->fwdAttn->wIns[4], w->Wo, DIM*DIM);
+    // fwdFFN: [0]=rms_ffn, [1]=W1, [2]=W3, [3]=W2
+    io_write_wf16(lk->fwdFFN->wIns[0], w->rms_ffn, DIM);
+    io_write_wf16(lk->fwdFFN->wIns[1], w->W1, HIDDEN*DIM);
+    io_write_wf16(lk->fwdFFN->wIns[2], w->W3, HIDDEN*DIM);
+    io_write_wf16(lk->fwdFFN->wIns[3], w->W2, DIM*HIDDEN);
+    // ffnBwd: [0]=W2, [1]=W1, [2]=W3
+    io_write_wf16(lk->ffnBwd->wIns[0], w->W2, DIM*HIDDEN);
+    io_write_wf16(lk->ffnBwd->wIns[1], w->W1, HIDDEN*DIM);
+    io_write_wf16(lk->ffnBwd->wIns[2], w->W3, HIDDEN*DIM);
+    // sdpaBwd1: [0]=Wo
+    io_write_wf16(lk->sdpaBwd1->wIns[0], w->Wo, DIM*DIM);
+    // qkvBwd: [0]=Wq, [1]=Wk, [2]=Wv
+    io_write_wf16(lk->qkvBwd->wIns[0], w->Wq, DIM*DIM);
+    io_write_wf16(lk->qkvBwd->wIns[1], w->Wk, DIM*DIM);
+    io_write_wf16(lk->qkvBwd->wIns[2], w->Wv, DIM*DIM);
+}
+
+// Compile weight-free sdpaBwd2 (purely computational, no weights)
 static Kern *compile_sdpa_bwd2(void) {
     return compile_kern_mil_w(gen_sdpa_bwd2(), @{},
         (2*SCORE_CH+2*DIM)*SEQ*2, 2*DIM*SEQ*2);
@@ -102,7 +126,6 @@ static Kern *compile_sdpa_bwd2(void) {
 static void free_layer_kernels(LayerKernels *lk) {
     free_kern(lk->fwdAttn); free_kern(lk->fwdFFN); free_kern(lk->ffnBwd);
     free_kern(lk->sdpaBwd1); free_kern(lk->qkvBwd);
-    // sdpaBwd2 is shared, freed separately
     lk->fwdAttn = lk->fwdFFN = lk->ffnBwd = lk->sdpaBwd1 = lk->qkvBwd = NULL;
 }
 
@@ -258,7 +281,7 @@ int main(int argc, char *argv[]) {
             printf("Params: %.2fM (transformer %.2fM + embed %.2fM)\n", tp/1e6, xfmr_params/1e6, embed_params/1e6);
             printf("Kernels: %d (%d weight-bearing + %d static sdpaBwd2)\n",
                    TOTAL_WEIGHT_KERNELS+NLAYERS, TOTAL_WEIGHT_KERNELS, NLAYERS);
-            printf("Accum %d steps per recompile | Adam LR=%.1e b1=%.1f b2=%.3f\n", ACCUM_STEPS, lr, adam_b1, adam_b2);
+            printf("Accum %d steps/batch | Adam LR=%.1e b1=%.1f b2=%.3f | dynamic weights\n", ACCUM_STEPS, lr, adam_b1, adam_b2);
             double fwd_f = NLAYERS*(4.0*2*DIM*DIM*SEQ + 2.0*2*DIM*HIDDEN*SEQ + 2.0*HIDDEN*DIM*SEQ);
             double bwd_dx_f = fwd_f, bwd_dw_f = fwd_f;
             double sdpa_f = NLAYERS*2.0*HEADS*5*SEQ*SEQ*HD;
@@ -298,19 +321,37 @@ int main(int argc, char *argv[]) {
         float *x_final = (float*)malloc(SEQ*DIM*4);     // after final rmsnorm
         float *logits = (float*)malloc(SEQ*VOCAB*4);     // [VOCAB, SEQ] for cross-entropy
         float *dlogits = (float*)malloc(SEQ*VOCAB*4);
+        // Pre-allocated to avoid calloc inside the training loop.
+        // rmsnorm_bwd writes dx fully before reading, so no zeroing needed.
+        float *dx_rms_final = (float*)malloc(SEQ*DIM*4);
+        float *dx_rms1      = (float*)malloc(SEQ*DIM*4);
 
-        // Compile static sdpaBwd2 kernels (no weights, one per layer)
+        // Compile all kernels once at startup (dynamic weights — no recompile per batch)
+        uint64_t tc0 = mach_absolute_time();
         Kern *sdpaBwd2[NLAYERS];
         for (int L=0; L<NLAYERS; L++) {
+            printf("  Compiling layer %d/%d...\r", L+1, NLAYERS); fflush(stdout);
+            if (!compile_layer_kernels(&kern[L])) {
+                printf("\nCompile failed at layer %d\n", L); return 1;
+            }
             sdpaBwd2[L] = compile_sdpa_bwd2();
             if (!sdpaBwd2[L]) { printf("sdpaBwd2 compile failed\n"); return 1; }
         }
+        double startup_compile_ms = tb_ms(mach_absolute_time() - tc0);
+        printf("  Compiled %d kernels in %.0fms (one-time cost)\n",
+               TOTAL_WEIGHT_KERNELS + NLAYERS, startup_compile_ms);
+
+        // Write initial weights to IOSurfaces
+        for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
+
+        // Cache _ANEClient for beginRealTimeTask/endRealTimeTask (90%+ jitter reduction)
+        ane_step_client_init(kern[0].fwdAttn);
 
         dispatch_queue_t dw_q = dispatch_queue_create("dw_cblas", DISPATCH_QUEUE_SERIAL);
         dispatch_group_t dw_grp = dispatch_group_create();
 
         float last_loss = 999.0f;
-        double total_compile_ms=0, total_train_ms=0;
+        double total_compile_ms = startup_compile_ms, total_train_ms=0;
         int total_steps_done=0, total_batches=0;
         uint64_t t_wall_start = mach_absolute_time();
 
@@ -318,47 +359,6 @@ int main(int argc, char *argv[]) {
 
         int step = start_step;
         while (step < total_steps) {
-            // Check compile budget
-            if (g_compile_count + TOTAL_WEIGHT_KERNELS > MAX_COMPILES) {
-                for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); }
-                double wall = tb_ms(mach_absolute_time() - t_wall_start);
-                save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
-                    total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
-                    total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
-                    lw, la, rms_final, &arms_final, embed, &aembed);
-                printf("[exec() restart step %d, %d compiles, loss=%.4f]\n", step, g_compile_count, last_loss);
-                fflush(stdout);
-                execl(argv[0], argv[0], "--resume", NULL);
-                perror("execl"); return 1;
-            }
-
-            // Compile all layers' weight-bearing kernels
-            uint64_t tc = mach_absolute_time();
-            for (int L=0; L<NLAYERS; L++) free_layer_kernels(&kern[L]);
-
-            bool compile_ok = true;
-            for (int L=0; L<NLAYERS; L++) {
-                printf("  Compiling layer %d/%d... (%d compiles)\r", L+1, NLAYERS, g_compile_count);
-                fflush(stdout);
-                if (!compile_layer_kernels(&kern[L], &lw[L])) {
-                    printf("\nCompile failed at layer %d, restart\n", L);
-                    compile_ok = false; break;
-                }
-            }
-            if (!compile_ok) { g_compile_count = MAX_COMPILES; continue; }
-
-            // Re-compile sdpaBwd2 if needed (after exec restart)
-            for (int L=0; L<NLAYERS; L++) {
-                if (!sdpaBwd2[L]) {
-                    sdpaBwd2[L] = compile_sdpa_bwd2();
-                    if (!sdpaBwd2[L]) { printf("sdpaBwd2 recompile failed\n"); return 1; }
-                }
-            }
-
-            double cms = tb_ms(mach_absolute_time() - tc);
-            total_compile_ms += cms;
-            printf("  Compiled %d kernels in %.0fms                    \n", TOTAL_WEIGHT_KERNELS, cms);
-
             // Zero gradient accumulators
             for (int L=0; L<NLAYERS; L++) layer_grads_zero(&grads[L]);
             memset(grms_final, 0, DIM*4);
@@ -369,6 +369,7 @@ int main(int argc, char *argv[]) {
             double t_ane=0,t_io=0,t_elem=0,t_rms=0,t_cblas_wait=0,t_cls=0;
 
             for (int a=0; a<ACCUM_STEPS && step<total_steps; a++, step++) {
+                ane_step_begin();
                 uint64_t t0,t1;
                 // Sample random position in token data
                 size_t max_pos = n_tokens - SEQ - 1;
@@ -452,10 +453,8 @@ int main(int argc, char *argv[]) {
                 });
 
                 // Final RMSNorm backward
-                float *dx_rms_final = (float*)calloc(SEQ*DIM, 4);
                 rmsnorm_bwd(dx_rms_final, grms_final, dy, x_cur, rms_final, DIM, SEQ);
                 memcpy(dy, dx_rms_final, SEQ*DIM*4);
-                free(dx_rms_final);
 
                 // ===== BACKWARD (12 layers, reverse) =====
                 for (int L=NLAYERS-1; L>=0; L--) {
@@ -494,7 +493,7 @@ int main(int argc, char *argv[]) {
                     memset(dx2, 0, SEQ*DIM*4);
                     rmsnorm_bwd(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
                     // Add residual: dx2 += dy (from skip connection)
-                    for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
+                    vDSP_vadd(dx2, 1, dy, 1, dx2, 1, (vDSP_Length)(SEQ*DIM));
 
                     // dWo async
                     memcpy(do_out_buf, dx2, SEQ*DIM*4);
@@ -540,7 +539,6 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].qkvBwd->ioOut, dx_attn, 0, DIM, SEQ);
 
                     // RMSNorm1 backward (using saved layer input)
-                    float *dx_rms1 = (float*)calloc(SEQ*DIM, 4);
                     rmsnorm_bwd(dx_rms1, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
 
                     // dy for next layer (going backward) = dx_rms1 + dx2 residual
@@ -570,14 +568,14 @@ int main(int argc, char *argv[]) {
                     //   dy_prev_layer = dx_rms1 + dx2  (skip connection input → x2)
                     //
                     // So: dy for previous layer = dx_rms1 + dx2
-                    for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_rms1[i] + dx2[i];
-                    free(dx_rms1);
+                    vDSP_vadd(dx_rms1, 1, dx2, 1, dy, 1, (vDSP_Length)(SEQ*DIM));
                 }
 
                 // Embedding backward
                 dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
                 embed_backward(gembed, dy, input_tokens, DIM, SEQ);
 
+                ane_step_end();
                 steps_batch++;
                 if (step % 10 == 0 || step == start_step)
                     printf("step %-4d loss=%.4f\n", step, loss);
@@ -605,11 +603,15 @@ int main(int argc, char *argv[]) {
             adam_t++;
             for (int L=0; L<NLAYERS; L++) {
                 LayerGrads *g = &grads[L];
-                for(size_t i=0;i<WQ_SZ;i++){g->Wq[i]*=gsc;g->Wk[i]*=gsc;g->Wv[i]*=gsc;g->Wo[i]*=gsc;}
-                for(size_t i=0;i<W1_SZ;i++) g->W1[i]*=gsc;
-                for(size_t i=0;i<W2_SZ;i++) g->W2[i]*=gsc;
-                for(size_t i=0;i<W3_SZ;i++) g->W3[i]*=gsc;
-                for(int i=0;i<DIM;i++){g->rms_att[i]*=gsc; g->rms_ffn[i]*=gsc;}
+                vDSP_vsmul(g->Wq, 1, &gsc, g->Wq, 1, (vDSP_Length)WQ_SZ);
+                vDSP_vsmul(g->Wk, 1, &gsc, g->Wk, 1, (vDSP_Length)WQ_SZ);
+                vDSP_vsmul(g->Wv, 1, &gsc, g->Wv, 1, (vDSP_Length)WQ_SZ);
+                vDSP_vsmul(g->Wo, 1, &gsc, g->Wo, 1, (vDSP_Length)WO_SZ);
+                vDSP_vsmul(g->W1, 1, &gsc, g->W1, 1, (vDSP_Length)W1_SZ);
+                vDSP_vsmul(g->W2, 1, &gsc, g->W2, 1, (vDSP_Length)W2_SZ);
+                vDSP_vsmul(g->W3, 1, &gsc, g->W3, 1, (vDSP_Length)W3_SZ);
+                vDSP_vsmul(g->rms_att, 1, &gsc, g->rms_att, 1, (vDSP_Length)DIM);
+                vDSP_vsmul(g->rms_ffn, 1, &gsc, g->rms_ffn, 1, (vDSP_Length)DIM);
 
                 adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps);
                 adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps);
@@ -621,14 +623,16 @@ int main(int argc, char *argv[]) {
                 adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, lr, adam_b1, adam_b2, adam_eps);
                 adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, lr, adam_b1, adam_b2, adam_eps);
             }
-            for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
+            vDSP_vsmul(grms_final, 1, &gsc, grms_final, 1, (vDSP_Length)DIM);
             adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps);
-            // Scale and update embed
-            for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
+            vDSP_vsmul(gembed, 1, &gsc, gembed, 1, (vDSP_Length)((size_t)VOCAB*DIM));
             adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps);
 
-            printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d]\n",
-                   steps_batch, cms, tms, tms/steps_batch, g_compile_count);
+            // Write updated weights to IOSurfaces (replaces per-batch recompile)
+            for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
+
+            printf("  [batch %d: train=%.1fms (%.1fms/step)]\n",
+                   steps_batch, tms, tms/steps_batch);
             printf("    ane=%.1f io=%.1f cls=%.1f elem=%.1f rms=%.1f cblas_wait=%.1f ms/step\n",
                    t_ane/steps_batch, t_io/steps_batch, t_cls/steps_batch, t_elem/steps_batch,
                    t_rms/steps_batch, t_cblas_wait/steps_batch);
@@ -639,12 +643,21 @@ int main(int argc, char *argv[]) {
                 double bs = NLAYERS * 2.0*HEADS*5*SEQ*SEQ*HD;
                 double ane_f_batch = (bf*2 + bs) * steps_batch;
                 double ane_tflops = ane_f_batch / (tms * 1e9);
-                fprintf(stderr, "{\"type\":\"batch\",\"batch\":%d,\"compile_ms\":%.1f,"
-                    "\"train_ms\":%.1f,\"ms_per_step\":%.1f}\n",
-                    steps_batch, cms, tms, tms/steps_batch);
+                fprintf(stderr, "{\"type\":\"batch\",\"batch\":%d,\"train_ms\":%.1f,\"ms_per_step\":%.1f}\n",
+                    steps_batch, tms, tms/steps_batch);
                 fprintf(stderr, "{\"type\":\"perf\",\"ane_tflops\":%.3f,\"ane_util_pct\":%.2f}\n",
                     ane_tflops, 100.0*ane_tflops/15.8);
             }
+        }
+
+        // Save final checkpoint
+        {
+            double wall0 = tb_ms(mach_absolute_time() - t_wall_start);
+            save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
+                total_compile_ms+cum_compile, total_train_ms+cum_train, wall0+cum_wall,
+                total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
+                lw, la, rms_final, &arms_final, embed, &aembed);
+            printf("[checkpoint saved: step %d, loss=%.4f]\n", step, last_loss);
         }
 
         // Efficiency report
@@ -681,6 +694,7 @@ int main(int argc, char *argv[]) {
         adam_free(&arms_final); adam_free(&aembed);
         free(dy); free(dffn); free(dh1); free(dh3); free(dx_ffn); free(dx2);
         free(do_out_buf); free(dq); free(dk); free(dv); free(dx_attn);
+        free(dx_rms_final); free(dx_rms1);
         free(x_cur); free(x_final); free(logits); free(dlogits);
     }
     return 0;
