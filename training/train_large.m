@@ -1,9 +1,11 @@
 // train_large.m — Train stories110M (12 layers, 768dim, 3072hidden) on ANE
 // Uses pretokenized TinyStories data with cross-entropy loss
-// 5 weight-bearing ANE kernels per layer × 12 layers = 60 per compile batch
+// 72 kernels compiled once at startup (dynamic weights — no per-batch recompile)
+// + 2 new: ANE classifier (32000-ch conv) + ANE softmax = 74 total
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
+#include "ane_classifier.h"
 
 #define CKPT_PATH "ane_stories110M_ckpt.bin"
 #define MODEL_PATH "../../assets/models/stories110M.bin"
@@ -319,8 +321,8 @@ int main(int argc, char *argv[]) {
         // x buffer for input to each layer (channel-first [DIM, SEQ])
         float *x_cur = (float*)malloc(SEQ*DIM*4);
         float *x_final = (float*)malloc(SEQ*DIM*4);     // after final rmsnorm
-        float *logits = (float*)malloc(SEQ*VOCAB*4);     // [VOCAB, SEQ] for cross-entropy
-        float *dlogits = (float*)malloc(SEQ*VOCAB*4);
+        float *probs   = (float*)malloc((size_t)SEQ*VOCAB*4);  // ANE softmax output [VOCAB,SEQ]
+        float *dlogits = (float*)malloc((size_t)SEQ*VOCAB*4);
         // Pre-allocated to avoid calloc inside the training loop.
         // rmsnorm_bwd writes dx fully before reading, so no zeroing needed.
         float *dx_rms_final = (float*)malloc(SEQ*DIM*4);
@@ -337,17 +339,34 @@ int main(int argc, char *argv[]) {
             sdpaBwd2[L] = compile_sdpa_bwd2();
             if (!sdpaBwd2[L]) { printf("sdpaBwd2 compile failed\n"); return 1; }
         }
+        // Classifier: embed [VOCAB,DIM] as dynamic weight, updated per Adam step
+        int cls_w[1] = {(int)((size_t)VOCAB*DIM*2)};
+        Kern *classifierKern = compile_kern_dyn(gen_classifier_fwd_dyn(), @{},
+            DIM*SEQ*2, cls_w, 1, (int)((size_t)VOCAB*SEQ*2));
+        if (!classifierKern) { printf("classifier compile failed\n"); return 1; }
+        // Softmax: no weights, static kernel
+        Kern *softmaxKern = compile_kern_mil_w(gen_softmax_vocab(), @{},
+            (int)((size_t)VOCAB*SEQ*2), (int)((size_t)VOCAB*SEQ*2));
+        if (!softmaxKern) { printf("softmax compile failed\n"); return 1; }
+
         double startup_compile_ms = tb_ms(mach_absolute_time() - tc0);
         printf("  Compiled %d kernels in %.0fms (one-time cost)\n",
-               TOTAL_WEIGHT_KERNELS + NLAYERS, startup_compile_ms);
+               TOTAL_WEIGHT_KERNELS + NLAYERS + 2, startup_compile_ms);
 
         // Write initial weights to IOSurfaces
         for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
+        io_write_fp16(classifierKern->wIns[0], embed, VOCAB, DIM);
 
         // Cache _ANEClient for beginRealTimeTask/endRealTimeTask (90%+ jitter reduction)
         ane_step_client_init(kern[0].fwdAttn);
 
-        dispatch_queue_t dw_q = dispatch_queue_create("dw_cblas", DISPATCH_QUEUE_SERIAL);
+        // Per-layer serial queues: layer L's dW runs concurrently with all other layers.
+        // Single dispatch_group tracks all pending work for the global Adam-update barrier.
+        dispatch_queue_t dw_q[NLAYERS];
+        for (int L = 0; L < NLAYERS; L++) {
+            char name[32]; snprintf(name, sizeof(name), "dw.%d", L);
+            dw_q[L] = dispatch_queue_create(name, DISPATCH_QUEUE_SERIAL);
+        }
         dispatch_group_t dw_grp = dispatch_group_create();
 
         float last_loss = 999.0f;
@@ -420,19 +439,32 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0);
                 }
 
-                // Final RMSNorm (CPU)
+                // Final RMSNorm (CPU — single call, cost ~0.1ms)
                 t0=mach_absolute_time();
                 rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0); t0=t1;
 
-                // Classifier: logits = embed^T @ x_final
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            VOCAB, SEQ, DIM, 1.0f,
-                            embed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+                // Classifier on ANE: x_final [DIM,SEQ] × embed [VOCAB,DIM] → logits [VOCAB,SEQ]
+                // embed IOSurface is refreshed once per Adam step after weight update.
+                io_write_fp16(classifierKern->ioIn, x_final, DIM, SEQ);
+                ane_eval(classifierKern);
+                // Softmax on ANE: io_copy avoids CPU round-trip between classifier and softmax
+                io_copy(softmaxKern->ioIn, 0, classifierKern->ioOut, 0, VOCAB, SEQ);
+                ane_eval(softmaxKern);
                 t1=mach_absolute_time(); t_cls+=tb_ms(t1-t0); t0=t1;
 
-                // Cross-entropy loss
-                float loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
+                // NLL loss + gradient on CPU (needs target indexing — can't avoid readback)
+                io_read_fp16(softmaxKern->ioOut, probs, 0, VOCAB, SEQ);
+                float total_loss = 0.0f;
+                float invS = 1.0f / SEQ;
+                memcpy(dlogits, probs, (size_t)VOCAB*SEQ*4);
+                for (int t = 0; t < SEQ; t++) {
+                    int tgt = target_tokens[t];
+                    total_loss -= logf(probs[tgt*SEQ + t] + 1e-10f);
+                    dlogits[tgt*SEQ + t] -= 1.0f;
+                }
+                vDSP_vsmul(dlogits, 1, &invS, dlogits, 1, (vDSP_Length)((size_t)VOCAB*SEQ));
+                float loss = total_loss / SEQ;
                 last_loss = loss;
                 t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
 
@@ -446,7 +478,7 @@ int main(int argc, char *argv[]) {
                             embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
 
                 // dembed[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
-                dispatch_group_async(dw_grp, dw_q, ^{
+                dispatch_group_async(dw_grp, dw_q[0], ^{
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                                 VOCAB, DIM, SEQ, 1.0f,
                                 dlogits, SEQ, x_final, SEQ, 1.0f, gembed, DIM);
@@ -479,7 +511,7 @@ int main(int argc, char *argv[]) {
                     float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh1, dh1, SEQ*HIDDEN*4);
                     float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh3, dh3, SEQ*HIDDEN*4);
                     float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
-                    dispatch_group_async(dw_grp, dw_q, ^{
+                    dispatch_group_async(dw_grp, dw_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                     1.0f, capt_dffn, SEQ, capt_silu, SEQ, 1.0f, gr->W2, HIDDEN);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
@@ -499,7 +531,7 @@ int main(int argc, char *argv[]) {
                     memcpy(do_out_buf, dx2, SEQ*DIM*4);
                     float *capt_do = (float*)malloc(SEQ*DIM*4); memcpy(capt_do, do_out_buf, SEQ*DIM*4);
                     float *capt_attn = (float*)malloc(SEQ*DIM*4); memcpy(capt_attn, ac->attn_out, SEQ*DIM*4);
-                    dispatch_group_async(dw_grp, dw_q, ^{
+                    dispatch_group_async(dw_grp, dw_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, capt_do, SEQ, capt_attn, SEQ, 1.0f, gr->Wo, DIM);
                         free(capt_do); free(capt_attn);
@@ -522,7 +554,7 @@ int main(int argc, char *argv[]) {
                     float *capt_dk = (float*)malloc(SEQ*DIM*4); memcpy(capt_dk, dk, SEQ*DIM*4);
                     float *capt_dv = (float*)malloc(SEQ*DIM*4); memcpy(capt_dv, dv, SEQ*DIM*4);
                     float *capt_xn = (float*)malloc(SEQ*DIM*4); memcpy(capt_xn, ac->xnorm, SEQ*DIM*4);
-                    dispatch_group_async(dw_grp, dw_q, ^{
+                    dispatch_group_async(dw_grp, dw_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, capt_dq, SEQ, capt_xn, SEQ, 1.0f, gr->Wq, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
@@ -630,6 +662,8 @@ int main(int argc, char *argv[]) {
 
             // Write updated weights to IOSurfaces (replaces per-batch recompile)
             for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
+            // Refresh embed in classifier IOSurface (embed changes each Adam step)
+            io_write_fp16(classifierKern->wIns[0], embed, VOCAB, DIM);
 
             printf("  [batch %d: train=%.1fms (%.1fms/step)]\n",
                    steps_batch, tms, tms/steps_batch);
@@ -688,6 +722,7 @@ int main(int argc, char *argv[]) {
             layer_acts_free(&acts[L]);
             layer_grads_free(&grads[L]);
         }
+        free_kern(classifierKern); free_kern(softmaxKern);
         munmap(token_data, data_len);
         close(data_fd);
         free(rms_final); free(embed); free(grms_final); free(gembed);
@@ -695,7 +730,7 @@ int main(int argc, char *argv[]) {
         free(dy); free(dffn); free(dh1); free(dh3); free(dx_ffn); free(dx2);
         free(do_out_buf); free(dq); free(dk); free(dv); free(dx_attn);
         free(dx_rms_final); free(dx_rms1);
-        free(x_cur); free(x_final); free(logits); free(dlogits);
+        free(x_cur); free(x_final); free(probs); free(dlogits);
     }
     return 0;
 }

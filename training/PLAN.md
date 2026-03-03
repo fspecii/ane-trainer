@@ -91,6 +91,31 @@ wrap each training step. `_ANEClient` is retrieved via `_sharedConnection` ivar 
 - Loss: 10.35 → 9.24 over 500 steps from random init (real convergence confirmed)
 - beginRealTimeTask: active, p99 jitter <3.5ms
 
+## M7 Optimizations (2026-03-03) — 20% additional speedup
+
+From 96ms → **76.9ms/step** steady state.
+
+### ANE Classifier + Softmax
+
+New: `ane_classifier.h` with `gen_classifier_fwd_dyn()` + `gen_softmax_vocab()`.
+
+- Classifier forward: matmul [1,VOCAB,DIM] @ [1,DIM,SEQ] → [1,VOCAB,SEQ] on ANE (32000-ch conv
+  rejected for dynamic inputs; matmul accepted). Dynamic embed IOSurface written once per Adam step.
+- Softmax: `io_copy` from classifier ioOut eliminates CPU round-trip, ANE eval, then CPU NLL read-back.
+- `t_cls`: 12ms → 3ms (-9ms/step)
+
+### Parallel Per-Layer dw_q
+
+- Was: 1 serial queue (85 cblas ops serialized). Blocked forward at start of each accum step.
+- Now: 12 per-layer serial queues, single dispatch_group. All 12 queues drain in parallel.
+- `t_cblas_wait`: non-zero → 0ms (fully overlaps with forward pass)
+
+### Results
+
+- 74 kernels at startup (72 layer + 2 new: classifier + softmax), compile cache active
+- t_ane=2.2, t_io=2.9, t_cls=3.0, t_elem=4.3, t_rms=0.1, t_cblas_wait=0.0 ms/step
+- ANE TFLOPS: 1.21 sustained, 7.7% utilization
+
 ## Next Steps (Tier 4)
 
 - [ ] Load pretrained stories110M weights (from ../../assets/models/stories110M.bin) —
