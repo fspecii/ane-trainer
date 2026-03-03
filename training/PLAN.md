@@ -104,3 +104,14 @@ Fused gen_sdpa_fwd_taps + gen_ffn_fwd_taps into single gen_fwd_fused kernel.
   - Theoretical savings: 12 × 420µs = ~5ms
   - Partial offset: larger fwdFwd ioOut (8MB vs 4MB) flush + x2 io_read back
 - 86 kernels compiled at startup (vs 74 old count, now correctly printed)
+
+## Plan H: ANE Classifier Backward (COMPLETE)
+Added gen_cls_bwd(): embed^T @ dlogits → dy on ANE, replacing CPU cblas_sgemm in backward critical path.
+- Kernel: [1,VOCAB,1,SEQ] dlogits + [1,VOCAB,DIM] We → [1,DIM,1,SEQ] dy
+  - matmul(transpose_x=true, x=We, y=dl3) — same IOSurface shape as classifier forward
+  - We IOSurface written once per Adam batch (io_write_fp16, 49MB, ~0.7ms/batch)
+- Per-step cost: io_write dlogits (16MB, ~0.24ms) + ane_eval (~0.5ms) + io_read dy (0.4MB)
+- Eliminated: cblas_sgemm(CblasTrans, DIM, SEQ, VOCAB) = 6.3 GFLOPS/step on CPU (~10ms)
+- Measured: cls(fwd+bwd)=4.5ms vs old ~12ms (cls_fwd ~2ms + untracked cblas ~10ms)
+- Step time: ~61ms (Plan G) → ~52ms (Plan H) ≈ -9ms/step
+- 87 kernels compiled at startup

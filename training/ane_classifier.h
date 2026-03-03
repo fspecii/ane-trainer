@@ -42,6 +42,36 @@ static NSString *gen_classifier_fwd_dyn(void) {
     return m;
 }
 
+// Classifier backward: dx_final = embed^T @ dlogits
+// Param 0 = dl   (ioIn,    VOCAB*SEQ*2 bytes fp16, [1, VOCAB, 1, SEQ]) — written per step
+// Param 1 = We   (wIns[0], VOCAB*DIM*2 bytes fp16, [1, VOCAB, DIM])   — written per Adam step
+// Output  = dx   [1, DIM, 1, SEQ] fp16 (DIM*SEQ*2 bytes)
+static NSString *gen_cls_bwd(void) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>("
+                    @"tensor<fp16, [1, %d, 1, %d]> dl, "
+                    @"tensor<fp16, [1, %d, %d]> We) {\n",
+                    VOCAB, SEQ, VOCAB, DIM];
+    // Reshape dl: [1, VOCAB, 1, SEQ] → [1, VOCAB, SEQ] for 3D matmul
+    [m appendFormat:@"        tensor<int32, [3]> sh3 = const()[name=string(\"sh3\"), "
+        "val=tensor<int32, [3]>([1,%d,%d])];\n", VOCAB, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d]> dl3 = reshape(shape=sh3,x=dl)"
+        "[name=string(\"dl3\")];\n", VOCAB, SEQ];
+    // matmul: We^T[1,DIM,VOCAB] @ dl3[1,VOCAB,SEQ] → mm[1,DIM,SEQ]
+    [m appendString:@"        bool bT = const()[name=string(\"bT\"), val=bool(true)];\n"];
+    [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d]> mm = matmul(transpose_x=bT,"
+        "transpose_y=bF,x=We,y=dl3)[name=string(\"mm\")];\n", DIM, SEQ];
+    // Reshape mm: [1, DIM, SEQ] → [1, DIM, 1, SEQ]
+    [m appendFormat:@"        tensor<int32, [4]> sh4 = const()[name=string(\"sh4\"), "
+        "val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = reshape(shape=sh4,x=mm)"
+        "[name=string(\"out\")];\n", DIM, SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
 // Softmax over VOCAB (axis=1): logits [1,VOCAB,1,SEQ] → probs [1,VOCAB,1,SEQ]
 // No weights — compile once at startup and reuse.
 // Use io_copy from classifierKern->ioOut to avoid CPU round-trip between classifier and softmax.

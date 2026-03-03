@@ -1,7 +1,7 @@
 // train_large.m — Train stories110M (12 layers, 768dim, 3072hidden) on ANE
 // Uses pretokenized TinyStories data with cross-entropy loss
 // 84 kernels compiled once at startup (dynamic weights — no per-batch recompile)
-// + 2: ANE classifier (32000-ch conv) + ANE softmax = 86 total
+// + 3: ANE classifier (32000-ch conv) + ANE softmax + ANE cls_bwd = 87 total
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
@@ -295,10 +295,10 @@ int main(int argc, char *argv[]) {
             double sdpa_f = NLAYERS*2.0*HEADS*5*SEQ*SEQ*HD;
             double cls_f = 2.0*VOCAB*DIM*SEQ;
             double total_f = fwd_f + bwd_dx_f + bwd_dw_f + sdpa_f + cls_f*3;
-            double ane_f = fwd_f + bwd_dx_f + bwd_dw_f + sdpa_f;
+            double ane_f = fwd_f + bwd_dx_f + bwd_dw_f + sdpa_f + 2.0*cls_f;
             printf("FLOPs/step: fwd=%.0fM bwd_dx=%.0fM bwd_dW=%.0fM sdpa_bwd=%.0fM total=%.0fM\n",
                    fwd_f/1e6, bwd_dx_f/1e6, bwd_dw_f/1e6, sdpa_f/1e6, total_f/1e6);
-            printf("ANE FLOPs/step: %.0fM (fwd+bwd_dx+bwd_dW+sdpa_bwd) | CPU: cls only\n\n", ane_f/1e6);
+            printf("ANE FLOPs/step: %.0fM (fwd+bwd_dx+bwd_dW+sdpa_bwd+cls_fwd+cls_bwd_dx) | CPU: cls_dembed\n\n", ane_f/1e6);
         }
 
         // mmap token data
@@ -345,14 +345,20 @@ int main(int argc, char *argv[]) {
         Kern *softmaxKern = compile_kern_mil_w(gen_softmax_vocab(), @{},
             (int)((size_t)VOCAB*SEQ*2), (int)((size_t)VOCAB*SEQ*2));
         if (!softmaxKern) { printf("softmax compile failed\n"); return 1; }
+        // Classifier backward: embed^T @ dlogits → dy (replaces cblas_sgemm in critical path)
+        int clsbwd_w[1] = {(int)((size_t)VOCAB*DIM*2)};
+        Kern *clsBwdKern = compile_kern_dyn(gen_cls_bwd(), @{},
+            (int)((size_t)VOCAB*SEQ*2), clsbwd_w, 1, DIM*SEQ*2);
+        if (!clsBwdKern) { printf("clsBwdKern compile failed\n"); return 1; }
 
         double startup_compile_ms = tb_ms(mach_absolute_time() - tc0);
         printf("  Compiled %d kernels in %.0fms (one-time cost)\n",
-               TOTAL_WEIGHT_KERNELS + 3*NLAYERS + 2, startup_compile_ms);
+               TOTAL_WEIGHT_KERNELS + 3*NLAYERS + 3, startup_compile_ms);
 
         // Write initial weights to IOSurfaces
         for (int L=0; L<NLAYERS; L++) write_layer_weights(&kern[L], &lw[L]);
         io_write_fp16(classifierKern->wIns[0], embed, VOCAB, DIM);
+        io_write_fp16(clsBwdKern->wIns[0], embed, VOCAB, DIM);
 
         // Cache _ANEClient for beginRealTimeTask/endRealTimeTask (90%+ jitter reduction)
         ane_step_client_init(kern[0].fwdFwd);
@@ -447,13 +453,12 @@ int main(int argc, char *argv[]) {
                 t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
 
                 // ===== BACKWARD =====
-                // dlogits already computed by cross_entropy_loss
 
-                // Classifier backward: dx_final = embed^T @ dlogits, dembed += dlogits @ x_final^T
-                // dx_final[DIM,SEQ] = embed^T[DIM,VOCAB] @ dlogits[VOCAB,SEQ]
-                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                            DIM, SEQ, VOCAB, 1.0f,
-                            embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
+                // Classifier backward dx: embed^T @ dlogits → dy  (ANE matmul)
+                io_write_fp16(clsBwdKern->ioIn, dlogits, VOCAB, SEQ);
+                ane_eval(clsBwdKern);
+                io_read_fp16(clsBwdKern->ioOut, dy, 0, DIM, SEQ);
+                t1=mach_absolute_time(); t_cls+=tb_ms(t1-t0); t0=t1;
 
                 // dembed[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
                 dispatch_group_async(dw_grp, dw_q[0], ^{
@@ -653,6 +658,7 @@ int main(int argc, char *argv[]) {
                 memset(gv, 0, DIM * 4);
             }
             IOSurfaceUnlock(classifierKern->wIns[0], 0, NULL);
+            io_write_fp16(clsBwdKern->wIns[0], embed, VOCAB, DIM);
             double t_embed_ms = tb_ms(mach_absolute_time() - te0);
             double t_sparse_ms = tb_ms(mach_absolute_time() - te1), t_iow_ms = 0.0;
             dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
@@ -660,7 +666,7 @@ int main(int argc, char *argv[]) {
 
             printf("  [batch %d: train=%.1fms (%.1fms/step) adam=%.1fms (embed=%.1f sparse=%.1f iow=%.1f layers_wait=%.1f)]\n",
                    steps_batch, tms, tms/steps_batch, t_adam_ms, t_embed_ms, t_sparse_ms, t_iow_ms, t_adam_ms - t_embed_ms);
-            printf("    ane=%.1f io=%.1f cls=%.1f elem=%.1f rms=%.1f cblas_wait=%.1f ms/step\n",
+            printf("    ane=%.1f io=%.1f cls(fwd+bwd)=%.1f elem=%.1f rms=%.1f cblas_wait=%.1f ms/step\n",
                    t_ane/steps_batch, t_io/steps_batch, t_cls/steps_batch, t_elem/steps_batch,
                    t_rms/steps_batch, t_cblas_wait/steps_batch);
 
@@ -695,7 +701,7 @@ int main(int argc, char *argv[]) {
         double sdpa_flops = NLAYERS * 2.0*HEADS*5*SEQ*SEQ*HD;
         double cls_flops = 2.0*VOCAB*DIM*SEQ;
         double total_flops = (fwd_flops*3 + sdpa_flops + cls_flops*3) * total_steps_done;
-        double ane_flops = (fwd_flops*3 + sdpa_flops) * total_steps_done;
+        double ane_flops = (fwd_flops*3 + sdpa_flops + 2.0*VOCAB*DIM*SEQ) * total_steps_done;
         printf("\n=== Efficiency Report ===\n");
         printf("Total steps:     %d\n", total_steps_done);
         printf("Wall time:       %.0f ms (%.1f s)\n", wall, wall/1000);
@@ -714,7 +720,7 @@ int main(int argc, char *argv[]) {
             layer_acts_free(&acts[L]);
             layer_grads_free(&grads[L]);
         }
-        free_kern(classifierKern); free_kern(softmaxKern);
+        free_kern(classifierKern); free_kern(softmaxKern); free_kern(clsBwdKern);
         munmap(token_data, data_len);
         close(data_fd);
         free(rms_final); free(embed); free(grms_final); free(gembed); free(embed_seen);
