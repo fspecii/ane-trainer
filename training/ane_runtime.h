@@ -60,10 +60,9 @@ static ANEKernel *ane_compile(NSData *milText, NSData *weightData,
     NSError *e = nil;
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    NSDictionary *wdict = nil;
-    if (weightData) {
-        wdict = @{@"@model_path/weights/weight.bin": @{@"offset": @0, @"data": weightData}};
-    }
+    NSDictionary *wdict = weightData
+        ? @{@"@model_path/weights/weight.bin": @{@"offset": @0, @"data": weightData}}
+        : @{};
     id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
         g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
         milText, wdict, nil);

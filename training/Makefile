@@ -13,7 +13,7 @@ train_large: train_large.m $(HEADERS_LARGE)
 
 PROBES = test_weight_reload test_perf_stats test_qos_sweep test_ane_advanced \
          test_perf_mask test_multi_func test_class_dump test_compile_cache \
-         test_io_profile test_chaining
+         test_io_profile test_io_pipeline test_chaining test_sram_sweep
 
 test_weight_reload: test_weight_reload.m
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -42,7 +42,13 @@ test_compile_cache: test_compile_cache.m
 test_io_profile: test_io_profile.m
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+test_io_pipeline: test_io_pipeline.m ane_runtime.h ane_mil_gen.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 test_chaining: test_chaining.m
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test_sram_sweep: test_sram_sweep.m ane_runtime.h ane_mil_gen.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 probes: $(PROBES)

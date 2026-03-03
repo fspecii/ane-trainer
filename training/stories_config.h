@@ -25,12 +25,9 @@
 #define ACCUM_STEPS 10
 #define MAX_COMPILES 100
 
-// Per compile: 5 weight-bearing kernels per layer + 1 classifier = 5*12+1 = 61
-// Plus 1 static (sdpaBwd2 per layer, no weights) = 12 more but those are weight-free
-// Actually sdpaBwd2 has no weights, compile once per layer
-// Weight-bearing: fwdAttn(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd1(1) + qkvBwd(1) = 5 per layer
-// 5 * 12 = 60 weight-bearing compiles per batch
-// With MAX_COMPILES=100, we get 1 batch of ACCUM_STEPS before restart
+// Weight-bearing kernels per layer: fwdAttn(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd12(1) + qkvBwd(1) = 5
+// Plus 3 weight-free kernels (dwW2, dwW13, dwWoQKV) = 8 total per layer (sdpaBwd2 fused into sdpaBwd12)
+// 5 * 12 = 60 weight-bearing kernels, 3 * 12 = 36 dW kernels = 96 total
 #define KERNELS_PER_LAYER 5
 #define TOTAL_WEIGHT_KERNELS (KERNELS_PER_LAYER * NLAYERS)
 
@@ -65,17 +62,12 @@ typedef struct {
 } LayerAdam;
 
 // Per-layer activation buffers (saved for backward)
+// Only fields needed for backward pass; taps stored in ANE IOSurfaces.
 typedef struct {
-    float *layer_in;    // [DIM, SEQ] input to this layer (for rmsnorm1 bwd)
-    float *xnorm;      // [DIM, SEQ] rmsnorm1 output
-    float *Q, *K, *V;  // [DIM, SEQ] QKV projections
-    float *attn_out;    // [DIM, SEQ] attention output (before Wo)
-    float *o_out;       // [DIM, SEQ] Wo output
-    float *x2;          // [DIM, SEQ] residual after attn
-    float *x2norm;      // [DIM, SEQ] rmsnorm2 output
-    float *h1, *h3;     // [HIDDEN, SEQ] FFN intermediates
-    float *silu_out;    // [HIDDEN, SEQ] SiLU(h1)*h3
-    float *ffn_out;     // [DIM, SEQ] FFN output
+    float *layer_in;    // [DIM, SEQ] input to this layer (rmsnorm1 bwd)
+    float *o_out;       // [DIM, SEQ] Wo output (attn residual add)
+    float *x2;          // [DIM, SEQ] residual after attn (rmsnorm2 bwd input)
+    float *ffn_out;     // [DIM, SEQ] FFN output (ffn residual add)
 } LayerActs;
 
 // Per-layer gradient accumulators
@@ -95,7 +87,8 @@ typedef struct {
     void *tmpDir;
 } Kern;
 typedef struct {
-    Kern *fwdAttn, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd;
+    Kern *fwdAttn, *fwdFFN, *ffnBwd, *sdpaBwd12, *qkvBwd;
+    Kern *dwW2, *dwW13, *dwWoQKV;
 } LayerKernels;
 
 // Checkpoint header
@@ -162,18 +155,13 @@ static void layer_adam_free(LayerAdam *a) {
 static LayerActs layer_acts_alloc(void) {
     LayerActs a;
     a.layer_in=(float*)malloc(SEQ*DIM*4);
-    a.xnorm=(float*)malloc(SEQ*DIM*4); a.Q=(float*)malloc(SEQ*DIM*4);
-    a.K=(float*)malloc(SEQ*DIM*4); a.V=(float*)malloc(SEQ*DIM*4);
-    a.attn_out=(float*)malloc(SEQ*DIM*4); a.o_out=(float*)malloc(SEQ*DIM*4);
-    a.x2=(float*)malloc(SEQ*DIM*4); a.x2norm=(float*)malloc(SEQ*DIM*4);
-    a.h1=(float*)malloc(SEQ*HIDDEN*4); a.h3=(float*)malloc(SEQ*HIDDEN*4);
-    a.silu_out=(float*)malloc(SEQ*HIDDEN*4); a.ffn_out=(float*)malloc(SEQ*DIM*4);
+    a.o_out=(float*)malloc(SEQ*DIM*4);
+    a.x2=(float*)malloc(SEQ*DIM*4);
+    a.ffn_out=(float*)malloc(SEQ*DIM*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
-    free(a->layer_in);free(a->xnorm);free(a->Q);free(a->K);free(a->V);
-    free(a->attn_out);free(a->o_out);free(a->x2);free(a->x2norm);
-    free(a->h1);free(a->h3);free(a->silu_out);free(a->ffn_out);
+    free(a->layer_in); free(a->o_out); free(a->x2); free(a->ffn_out);
 }
 static LayerGrads layer_grads_alloc(void) {
     LayerGrads g;

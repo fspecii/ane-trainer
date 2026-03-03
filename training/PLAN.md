@@ -1,156 +1,98 @@
-# ANE Training — Next Steps Plan
+# ANE Optimization Plan
 
-## Tier 1 — Immediate, High ROI
+## Current State (post-Phase 7 / Plan C)
+- Forward+backward: ~54ms/step (10-step batch = ~540ms)
+- Adam: ~37ms/batch (3.7ms/step amortized)
+- Total effective: ~57.7ms/step
+- ANE utilization: ~15.8% of 15.8 TFLOPS peak
+- FLOPs on ANE: ~78% (136B/174B per step)
+- ANE kernels per layer: fwdAttn, fwdFFN, ffnBwd, sdpaBwd1, sdpaBwd2, qkvBwd, dwW2, dwW13, dwWoQKV = 9
+- Total ANE evals per step: 9×12 = 108
 
-- [x] Implement compile cache in `ane_runtime.h` + `stories_io.h` — copy `data` + `net.plist`
-  to `~/.ane_cache/<hexId>/` after compile, restore + skip `compileWithQoS:` on cache hit.
-  **Result**: 5x compile speedup on cache hits (700ms vs 3800ms for 72 kernels).
-  - Static kernels (12 sdpaBwd2, no weights) → always cache hit after first run
-  - Weight-bearing kernels → cache hit on crash recovery from same checkpoint
-  - Steady state: 12/72 cache hits = ~500ms saved per restart
-- [x] Get real TinyStories data (`tinystories_data00.bin`) and run `train_large` for proper
-  convergence. **Result**: 50M tokens (95MB) from roneneldan/TinyStories via HuggingFace.
-  LLaMA-2 BPE 32K vocab tokenizer. First 10 tokens: (1, 3118, 2462, 29892, 263, 2217, 7826,
-  4257, 365, 2354). Convergence: 10.35→9.24 loss over 500 steps from random init.
+## Plan A: Backward Attention Kernel Fusion (FAILED)
+Goal: Fuse sdpaBwd1 + sdpaBwd2 + qkvBwd into single bwdAttn kernel
 
-## BREAKTHROUGH — Dynamic Weights (2026-03-02)
+Failed: ANE compiler "cycle path" errors — fused kernel had data dependency cycles
+that the compiler refused to compile. Restored to Phase 6 state.
 
-`mil_gen_matmul` in `ane_mil_gen.h` declares **both x and W as runtime tensor inputs** (no
-BLOBFILE). This means the weight IOSurface can be updated between evals with no recompile.
+bwdAttn spec (for future retry):
+- Input:  [1, 4*DIM, 1, SEQ] = qf|kf|vf|dx2f
+- Weights: Wo, Wq, Wk, Wv each [1,DIM,DIM]
+- Output: [1, 4*DIM, 1, SEQ] = dx_qkv|dvf|dqf|dkf
+- 4*DIM = 3072 channels OK
 
-Proven in `test_dynamic_matmul.m`:
-- W = identity → y = x  ✓
-- W = 2x identity (write IOSurface only, no recompile) → y = 2x  ✓
-- Max numerical error: 0.000015 (FP16 precision)
-- Weight update cost: **0.002ms** (IOSurface write)
-- Eval cost: **0.14ms**
-- **vs 61.5ms compile+load: 494x speedup**
+Expected: 108->84 ANE evals/step, ~45ms/step, ~18-20% util
+Status: Deferred — cycle path errors need investigation
 
-Input order is **[W, x]** not [x, W] (status=0x1d error indicates wrong order).
+## Plan B: ANE Adam (INFEASIBLE)
+Moving Adam optimizer to ANE. Three hard blockers:
+1. fp16 moment precision: b1^t ≈ 2.6e-46 after ~17 steps (underflows fp16)
+2. Per-step bias correction factors 1/(1-b1^t) change every batch → can't be MIL constants
+3. ANE dispatch overhead ~0.02ms >> element-wise compute ~0.37µs per tensor
 
-**What this means for training**:
-- Compile 72 kernels ONCE at startup (~1.3s one-time cost)
-- Per training step: write W to IOSurface (0.002ms) + eval (0.14ms) — no restart, no recompile
-- The exec() restart hack is now completely obsolete
-- The 119-compile limit is irrelevant once you compile once
+## Plan C: Parallel + Fused Adam (COMPLETE)
+Implemented in phases — total improvement: Adam 80ms → 37ms per 10-step batch.
 
-**Required work**: Rewrite `stories_mil.h` to use weight-as-input instead of BLOBFILE.
-All forward and backward kernels need W declared as function parameters, not BLOBFILE consts.
+### C1: Thread-safe adam_update
+- Removed `static` from mh/vh/g2 stack buffers — enables parallel dispatch
 
-## BREAKTHROUGH — beginRealTimeTask (2026-03-03)
+### C2: Parallel layer Adam
+- Dispatched 12-layer Adam+write_layer_weights to existing per-layer dw_q[L] queues
+- All 12 layers run concurrently; serial queue order ensures Adam before weight write
+- Saved ~6ms vs serial layer loop
 
-`beginRealTimeTask`/`endRealTimeTask` on `_ANEClient` reduces scheduling jitter by **90.6%**.
+### C3: adam_update_fused with inline gsc
+- New NEON-explicit Adam: vrsqrteq_f32 + one Newton-Raphson step
+- Fuses gradient scaling (gsc=1/steps_batch) into a single DRAM pass
+- Eliminates vDSP chunking overhead (was 120K dispatches for embed)
+- All Adam calls switched from chunked vDSP to fused NEON
 
-Proven in `test_realtime_task.m`:
-- Plain eval:  mean=0.621ms  p99=35.173ms (massive tail from ANE scheduler preemption)
-- With RT task: mean=0.387ms  p99=3.321ms  (near-zero tail)
-- **90.6% p99 improvement** — free, zero-overhead wrapper
+### C4: Sparse embed Adam
+- Track unique tokens per batch (embed_seen[VOCAB] uint8_t, set during embed_backward)
+- Expected ~2464 unique tokens / 32000 vocab (~7.7% of rows) per 10-step batch
+- Only process seen rows: ~37MB vs 491MB (~13x less DRAM traffic)
+- Sparse zero of gembed inside the loop; eliminates 98MB memset per batch
 
-**Implementation**: `stories_io.h` exposes `ane_step_begin()` / `ane_step_end()` which
-wrap each training step. `_ANEClient` is retrieved via `_sharedConnection` ivar of
-`_ANEInMemoryModel` and cached in `g_ane_rt_client`.
+### C5: Fused embed Adam + IOSurface write
+- Lock classifier IOSurface once per Adam step
+- Within sparse loop: Adam update then cvt_f32_f16 to IOSurface in one pass
+- Wrote rows are cache-hot from Adam → near-zero extra DRAM traffic for fp16 write
+- Eliminated 13ms full-surface io_write_fp16 call
+- Result: embed 80ms → 3ms (27x speedup)
 
-**ANE class hierarchy (confirmed)**:
-- `_ANEVirtualClient` = server-side class in XPC daemon (`com.apple.appleneuralengine`, pid~444)
-- `_ANEClient` = user-space proxy, retrieved via `_ANEInMemoryModel._sharedConnection` ivar
-- `_ANEClient._fastConn`/`._conn` = `_ANEDaemonConnection` → `NSXPCConnection`
-- `getDeviceInfo` is server-side only — not accessible from user space
+### Measured Results
+| Stage            | Adam/batch | Embed | Layer+wait | Notes                |
+|------------------|-----------|-------|------------|----------------------|
+| Phase 6 baseline | 80ms      | 80ms  | 0ms        | embed was bottleneck |
+| After C1-C3      | 45ms      | 11ms  | 34ms       | layers now bottleneck|
+| After C4-C5      | 37ms      |  3ms  | 34ms       | bandwidth-bound      |
 
-## Tier 2 — New Capabilities (Results: 2026-03-03)
+Layer Adam is bandwidth-bound: 12 layers × ~200MB × 7 passes / 68GB/s ≈ 37ms min.
 
-- [x] Multi-function MIL dispatch: `gen_two_func_mil()` — **compiles in 19.7ms vs 52.3ms
-  separately = 2.7x speedup**. procedureIndex=0 works, procedureIndex=1 fails (status=0x2).
-  Use case: compile fwd+bwd together; dispatch by index. Half not working yet.
-- [x] `beginRealTimeTask`/`endRealTimeTask`: **90.6% p99 jitter reduction** — integrated into
-  `train_large.m`. See BREAKTHROUGH section above.
-- [x] `validateNetworkCreate:` is server-side only (`_ANEVirtualClient` in XPC daemon).
-  Not accessible from user space without crafting raw XPC messages.
+## Plan D: sdpaBwd1 + sdpaBwd2 Fusion (COMPLETE — net neutral)
+Fused sdpaBwd1+sdpaBwd2 into single gen_sdpa_bwd12 kernel.
+- Cycle-path blocker resolved by saving forward-pass softmax aw in fwdAttn ioOut (ch 6*DIM)
+  - gen_sdpa_fwd_taps: output expanded to [oo|qf|kf|vf|af|xn|aw_flat] = (6*DIM+SCORE_CH)*SEQ
+  - gen_sdpa_bwd12: input [probs_flat|qf|kf|vf|dx2f] = (SCORE_CH+4*DIM)*SEQ — no softmax recompute
+- Result: 108 → 96 ANE evals/step (12 fewer: sdpaBwd2 + io_copy per layer eliminated)
+- Measured performance: ~63-65ms/step vs ~57.7ms Plan C baseline
+  - Net neutral: 12 fewer ANE evals (~5ms savings) offset by +18MB/step probs write to fwdAttn ioOut
+  - The saved probs (SCORE_CH=3072 ch × 12 layers = 18MB) costs bandwidth ≈ what we saved in XPC dispatch
+- Status: Compiles, runs correctly, 96 evals/step confirmed
 
-## Tier 3 — Deeper Exploration (Results: 2026-03-03)
+## Option E: Pipelined Adam (Future)
+Overlap Adam with next batch's first steps by streaming layer-by-layer:
+- Layer L's Adam dispatched → immediately start forward pass for layer L+1
+- Requires fine-grained dependency tracking (each layer's write must precede its read)
+- Potential: hide most of 37ms Adam behind forward pass
+- High implementation complexity
 
-- [x] `test_perf_mask` fixed (two bugs: wrong calling convention + wrong array type).
-  **Finding**: `perfStats:` expects `NSArray<_ANEPerformanceStatsIOSurface*>`, not bare
-  `_ANEPerformanceStats`. `_ANEPerformanceStatsIOSurface` wraps an IOSurface with statType
-  (int64_t). Evals succeed but ANE writes no data — likely entitlement-gated
-  (`com.apple.ane.perf-counters` or similar). `driverMaskForANEFMask:` maps bits:
-  0x1→0x1, 0x2→0x4, 0x3→0x5, 0xF→0xF, 0xFF→0x0.
-- [x] `_ANESharedSignalEvent` fully characterized:
-  - Factory: `+ signalEventWithValue:symbolIndex:eventType:sharedEvent:` (IOSurfaceSharedEvent)
-  - Ivars: symbolIndex(I), value(Q), agentMask(Q), eventType(q), sharedEvent(IOSurfaceSharedEvent)
-  - Used in `_ANEChainingRequest.signalEvents` (NSArray) for Metal↔ANE synchronization
-  - Companion: `_ANESharedWaitEvent` with `+ waitEventWithValue:sharedEvent:eventType:`
-  - alloc/init returns nil — factory methods required; Metal SharedEvent needed
-- [x] `getDeviceInfo` on `_ANEVirtualClient` — **server-side only** (XPC daemon).
-  Returns `{DeviceExtendedInfo={DeviceInfo=IqqB}BII[32c]}` struct with chip_id, freq_hz,
-  max_freq_hz, has_ane, is_available, name[32]. Not accessible from user space.
+## Option F: Reduce Weight Write Bandwidth
+write_layer_weights accounts for ~12ms of the 37ms layer Adam (12 layers × ~1MB fp16)
+- Cache weights in fp16 on CPU; Adam updates fp32 copy then converts
+- Already doing this. No further optimization without fp16 Adam precision issues.
 
-## Training Baseline (2026-03-03)
-
-- Speed: **138.6ms/step** average (500 steps, real TinyStories data)
-- ANE: 0.67 TFLOPS sustained (out of 15.8 peak = 4.2% utilization)
-- Loss: 10.35 → 9.24 over 500 steps from random init (real convergence confirmed)
-- beginRealTimeTask: active, p99 jitter <3.5ms
-
-## M7 Optimizations (2026-03-03) — 20% additional speedup
-
-From 96ms → **76.9ms/step** steady state.
-
-### ANE Classifier + Softmax
-
-New: `ane_classifier.h` with `gen_classifier_fwd_dyn()` + `gen_softmax_vocab()`.
-
-- Classifier forward: matmul [1,VOCAB,DIM] @ [1,DIM,SEQ] → [1,VOCAB,SEQ] on ANE (32000-ch conv
-  rejected for dynamic inputs; matmul accepted). Dynamic embed IOSurface written once per Adam step.
-- Softmax: `io_copy` from classifier ioOut eliminates CPU round-trip, ANE eval, then CPU NLL read-back.
-- `t_cls`: 12ms → 3ms (-9ms/step)
-
-### Parallel Per-Layer dw_q
-
-- Was: 1 serial queue (85 cblas ops serialized). Blocked forward at start of each accum step.
-- Now: 12 per-layer serial queues, single dispatch_group. All 12 queues drain in parallel.
-- `t_cblas_wait`: non-zero → 0ms (fully overlaps with forward pass)
-
-### Results
-
-- 74 kernels at startup (72 layer + 2 new: classifier + softmax), compile cache active
-- t_ane=2.2, t_io=2.9, t_cls=3.0, t_elem=4.3, t_rms=0.1, t_cblas_wait=0.0 ms/step
-- ANE TFLOPS: 1.21 sustained, 7.7% utilization
-
-## Next Steps (Tier 4)
-
-- [ ] Load pretrained stories110M weights (from ../../assets/models/stories110M.bin) —
-  currently missing. Download from karpathy/llama2.c project or train from better init.
-- [ ] Profile ANE utilization bottleneck: 4.2% is very low. IOSurface write overhead
-  (t_io=7-15ms) dominates over ANE compute (t_ane=2.7ms). Investigate:
-  - Can IOSurface writes be pipelined/async?
-  - Can `_ANEChainingRequest` chain fwd→bwd without CPU round-trip?
-  - `_ANESharedSignalEvent` for Metal↔ANE sync
-- [ ] Investigate procedureIndex=1 failure in multi-function MIL (status=0x2).
-  Could allow fwd+bwd in single compiled program, reducing compile slots further.
-- [ ] Weight tiling / chunked IOSurface writes to reduce t_io overhead.
-
-## CPU Speed Optimizations (2026-03-03)
-
-Implemented in `stories_cpu_ops.h` and `train_large.m`:
-
-- **Pre-allocated rmsnorm scratch** (`g_rms_ss`, `g_rms_rrms`, `g_rms_dot`): eliminated
-  120+ `calloc`/`free` calls per optimizer step (3 allocs × 12 layers × 10 accum steps).
-  Now uses `memset` to zero before each call.
-
-- **Pre-allocated cross-entropy buffer** (`g_ce_buf`): eliminated 32MB `malloc`/`free`
-  per accumulation step (10×/optimizer step). Buffer allocated once on first call.
-
-- **Vectorized `adam_update`** with chunked vDSP + `vvrsqrtf` (ADAM_CHUNK=2048):
-  replaced per-element scalar `sqrtf` loop for up to 24.6M elements (embed+all layers).
-  Approximation: `1/sqrt(v/bc2 + eps)` instead of `1/(sqrt(v/bc2) + eps)` — identical
-  at eps=1e-8 for normal gradient magnitudes.
-
-- **Pre-allocated `dx_rms_final`/`dx_rms1`**: eliminated `calloc`/`free` for these
-  SEQ×DIM buffers from inside the training loop. rmsnorm_bwd fully writes dx before
-  reading, so no zeroing needed.
-
-- **Vectorized gradient scaling** (`vDSP_vsmul` instead of scalar loops):
-  WQ_SZ × 4 matrices + W1/W2/W3 + embed (24.6M elements) per optimizer step.
-
-- **Vectorized residual-add** (`vDSP_vadd` for dx2 += dy and dy = dx_rms1 + dx2):
-  SEQ×DIM=196K elements × 12 layers per step.
+## Option G: ANE Forward Kernel Fusion (High Impact)
+108 ANE evals × ~420µs XPC overhead = ~45ms/step of pure scheduling
+If fwdAttn+fwdFFN fused: 108 → 84 evals → save ~10ms/step
+Most impactful remaining optimization.

@@ -62,6 +62,39 @@ static void rmsnorm_bwd(float *dx, float *dw, const float *dy, const float *x, c
     }
 }
 
+// Fused single-pass Adam: applies gradient scaling (gsc), moment updates, and weight update in one
+// DRAM pass. Eliminates per-chunk vDSP dispatch overhead and a separate gradient-scale pass.
+// Uses explicit NEON (vrsqrte + one NR step ≈ 16-bit reciprocal sqrt, sufficient for Adam).
+static void adam_update_fused(float *restrict w, const float *restrict g, AdamState *s, int t,
+                               float lr, float b1, float b2, float eps, float gsc) {
+    float bc1 = 1.0f - powf(b1, t), bc2 = 1.0f - powf(b2, t);
+    float inv_bc1 = 1.0f / bc1, inv_bc2 = 1.0f / bc2;
+    float b1c = 1.0f - b1, b2c = 1.0f - b2, neg_lr = -lr;
+    float *m = s->m, *v = s->v;
+    size_t n = s->n, i = 0;
+    float32x4_t vb1 = vdupq_n_f32(b1), vb1c = vdupq_n_f32(b1c);
+    float32x4_t vb2 = vdupq_n_f32(b2), vb2c = vdupq_n_f32(b2c);
+    float32x4_t vibc1 = vdupq_n_f32(inv_bc1), vibc2 = vdupq_n_f32(inv_bc2);
+    float32x4_t vnlr  = vdupq_n_f32(neg_lr),   veps  = vdupq_n_f32(eps);
+    float32x4_t vgsc  = vdupq_n_f32(gsc);
+    for (; i + 3 < n; i += 4) {
+        float32x4_t gi = vmulq_f32(vld1q_f32(g + i), vgsc);
+        float32x4_t mi = vfmaq_f32(vmulq_f32(vb1, vld1q_f32(m + i)), vb1c, gi);
+        float32x4_t vi = vfmaq_f32(vmulq_f32(vb2, vld1q_f32(v + i)), vb2c, vmulq_f32(gi, gi));
+        vst1q_f32(m + i, mi); vst1q_f32(v + i, vi);
+        float32x4_t vhat = vfmaq_f32(veps, vi, vibc2);
+        float32x4_t e = vrsqrteq_f32(vhat);
+        e = vmulq_f32(vrsqrtsq_f32(vmulq_f32(vhat, e), e), e);  // one NR step
+        float32x4_t step = vmulq_f32(vmulq_f32(mi, vibc1), e);
+        vst1q_f32(w + i, vfmaq_f32(vld1q_f32(w + i), vnlr, step));
+    }
+    for (; i < n; i++) {
+        float gi = g[i] * gsc, mi = b1 * m[i] + b1c * gi, vi = b2 * v[i] + b2c * gi * gi;
+        m[i] = mi; v[i] = vi;
+        w[i] += neg_lr * (mi * inv_bc1) / sqrtf(vi * inv_bc2 + eps);
+    }
+}
+
 // Vectorized Adam using vDSP + vvrsqrtf (chunked to keep temps on stack).
 // Approximates 1/(sqrt(v/bc2) + eps) as 1/sqrt(v/bc2 + eps) — negligible
 // difference at eps=1e-8 for typical gradient magnitudes.
@@ -69,7 +102,7 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
     float bc1 = 1.0f - powf(b1, t), bc2 = 1.0f - powf(b2, t);
     float inv_bc1 = 1.0f/bc1, inv_bc2 = 1.0f/bc2, neg_lr = -lr;
     float b1c = 1.0f - b1, b2c = 1.0f - b2;
-    static float mh[ADAM_CHUNK], vh[ADAM_CHUNK], g2[ADAM_CHUNK];
+    float mh[ADAM_CHUNK], vh[ADAM_CHUNK], g2[ADAM_CHUNK];
     for (size_t i = 0; i < s->n; i += ADAM_CHUNK) {
         int c = (s->n - i < ADAM_CHUNK) ? (int)(s->n - i) : ADAM_CHUNK;
         // m = b1*m + (1-b1)*g

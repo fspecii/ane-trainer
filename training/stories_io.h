@@ -90,6 +90,19 @@ static void io_write_wf16(IOSurfaceRef s, const float *data, int n) {
     IOSurfaceUnlock(s, 0, NULL);
 }
 
+// NEON vectorized fp16 accumulate into fp32: dst[i] += (float)src[i]
+static void acc_f16_f32(float *dst, const _Float16 *src, int n) {
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16*)(src + i));
+        float32x4_t lo = vaddq_f32(vld1q_f32(dst + i),   vcvt_f32_f16(vget_low_f16(h)));
+        float32x4_t hi = vaddq_f32(vld1q_f32(dst + i+4), vcvt_f32_f16(vget_high_f16(h)));
+        vst1q_f32(dst + i,   lo);
+        vst1q_f32(dst + i+4, hi);
+    }
+    for (; i < n; i++) dst[i] += (float)src[i];
+}
+
 // Kernel compile/eval — static weights (BLOBFILE), single activation input
 static Kern *compile_kern_mil_w(NSString *mil, NSDictionary *weights, int ic_bytes, int oc_bytes) {
     @autoreleasepool {
